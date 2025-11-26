@@ -1,0 +1,45 @@
+# Experiment setup
+reg_type: 'taylor-full'      # 'ewc', 'taylor-diag', 'taylor-full'
+accumulate: true     # Goal 2: True (keep/accumulate) or False (reset)
+curvature_type: 'fisher'  # 'hessian', 'fisher'
+ignore_gradient : True  # Whether to ignore the gradient term in Taylor expansion
+
+# Data
+environment: '2d_classification'  # fixed
+environment_args:
+  train_ratio: 0.8
+  npz_file: 'sine_dataset_10.npz'
+  root: '../datasets/synthetic/'
+  num_tasks: 9
+
+
+# Training
+alpha: 1.0         # Regularization strength
+num_steps: 100       # Steps *per task* - make it a multiple of log_every_n_steps
+reg_subsample_frac: 0.1  # Fraction of task data to use for regularizer update (1.0 = all)
+replay_subsample_frac: 1.0
+batch_size: 32
+optimizer: 
+  name: 'adam'     # 'sgd', 'adam'
+  lr: 0.01
+  warmup_on: false      # Whether to use learning rate warmup
+  weight_decay: 0.001
+scheduler:
+  name: 'cosine_anneal'  # 'step', 'plateau', 'cosine_anneal'
+  eps: 1e-8            # Epsilon for optimizers
+  patience: 20         # Early stopping patience (in epochs)
+  steps_per_task: 100  # Number of steps per task (for scheduler)
+network:
+  name: 'MLP'        # 'mlp', 'cnn'
+  depth: 1
+  width: 100
+  activation: 'relu'  # 'relu', 'tanh', 'sigmoid'
+loss: 'CE'  # 'MSE', 'CE'
+
+# Tracking
+# How often to log metrics during a task's training (in steps)
+log_every_n_steps: 1
+
+# Extra args
+seed : 42
+device : 'cuda:4'
