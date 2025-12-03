@@ -158,7 +158,7 @@ class BaseRegularizer(ABC):
         """
         pass
 
-    def update(self, model, task_dataset, loss_fn, accumulate=True):
+    def update(self, model, task_dataset, loss_fn, accumulate=True, save_path=None):
         """
         Updates the regularizer's state after training on a new task.
         Handles both task-specific (accumulate=True) and
@@ -241,6 +241,9 @@ class BaseRegularizer(ABC):
             self.per_sample_losses = new_losses
             self.past_sample_anchor_idx = new_anchor_indices
 
+        if save_path is not None:
+            self.save_artifacts(save_path)
+
     def reset(self):
         """Resets regularizer state completely."""
         self.anchor_param_list = []
@@ -255,6 +258,32 @@ class BaseRegularizer(ABC):
         """Returns all stored (x_i, y_i) pairs."""
         return self.past_samples
 
+    def save_artifacts(self, save_dir):
+        """
+        Internal method to dump the current state of the regularizer to disk.
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"  [Regularizer] Saving artifacts to {save_dir}...")
+
+        # 1. Save Anchors
+        # This is a list of flat tensors. 
+        # For Accumulate: multiple anchors. For Reset: one anchor.
+        torch.save(self.anchor_param_list, os.path.join(save_dir, 'anchors.pt'))
+
+        # 2. Save Samples
+        # self.past_samples is a list of (x, y) tuples. 
+        # We verify they are on CPU to save space/compatibility.
+        samples_cpu = [(x.cpu(), y.cpu()) for x, y in self.past_samples]
+        torch.save(samples_cpu, os.path.join(save_dir, 'samples.pt'))
+
+        # 3. Save Fisher/Hessian (Conditional)
+        # If Diag/Block, it's small, so we save it for convenience.
+        # If Full, it's massive, so we SKIP it (recompute from samples+anchor later).
+        if self.structure in ['diag', 'block']:
+            torch.save(self.per_sample_importances, os.path.join(save_dir, 'importances.pt'))
+        else:
+            print(f"  [Regularizer] Skipping Full Matrix save (structure={self.structure}). "
+                  "Recompute from 'anchors.pt' and 'samples.pt'.")
 # --- Implementation 1: EWC ---
 
 class EWCRegularizer(BaseRegularizer):

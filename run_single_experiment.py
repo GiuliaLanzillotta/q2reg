@@ -52,6 +52,7 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
     
     replay_buffer = [] 
     results = {} 
+    top_eigs = None
 
     print(f"=== Starting Loop: Mode={training_mode}, Tasks={config['environment_args']['num_tasks']} ===")
 
@@ -81,6 +82,32 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
         task_iterator = itertools.cycle(train_loader)
         task_metrics = {'history': [], 'landscape': []}
 
+        # --- Setup Alignment Tracking (Using Shadow Monitor as Reference) ---
+        top_eigs = None
+        alignment_history = []
+        previous_params = utils.get_flat_params(network) # Initialize outside loop
+        if t > 0:
+            # We use the shadow monitor (Accumulate) as the "Ground Truth" for geometry
+            # This works for Sequential, Replay, AND Regularized modes!
+            ref_reg = shadow_monitor.reg_accum
+            
+            if len(ref_reg.per_sample_importances) > 0:
+                # print("Computing top eigenvectors of Shadow Monitor for alignment check...")
+                
+                # 1. Sum per-sample importances -> Total Curvature
+                total_lambda = utils_landscape.get_total_curvature_from_regularizer(ref_reg)
+                
+                # 2. Extract Top Eigenvectors (e.g. Top 10)
+                if total_lambda is not None:
+                    top_eigs = utils_landscape.get_top_eigenvectors(
+                        total_lambda, 
+                        k=10, 
+                        structure=ref_reg.structure
+                    )
+                    # CRITICAL: Move to GPU immediately
+                    if top_eigs is not None:
+                        top_eigs = top_eigs.to(device)
+
         # --- Training Loop ---
         num_chunks = config['num_steps'] // config['log_every_n_steps']
         
@@ -96,6 +123,9 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
                 f"PAST-REG Acc: {acc_reg*100:6.2f}%"
             )
 
+            print("Computing top eigenvectors of regularizer for alignment check...")
+    
+
         for chunk_idx in tqdm(range(num_chunks), desc=f'Task {t} ({training_mode})'):
             
             # A. Train Step
@@ -103,6 +133,8 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
                 network, task_iterator, active_regularizer, optimizer, 
                 scheduler, loss_fn, config['log_every_n_steps'], device
             )
+            # Landscape Stats
+            task_metrics['landscape'].append(avg_landscape)
             
             step = (chunk_idx + 1) * config['log_every_n_steps']
             
@@ -114,8 +146,6 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
                 
                 task_metrics['history'].append(monitor_stats)
                 
-                # Landscape Stats
-                task_metrics['landscape'].append(avg_landscape)
                 
                 # Evaluate on ALL past samples (Replay Buffer)
                 past_metrics_all = training.evaluate_on_all_past(network, replay_buffer, loss_fn, device)
@@ -129,9 +159,28 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
                     f"REG: {acc_reg*100:5.1f}% | "
                     f"Sharp: {avg_landscape.get('sharpness', 0):.4f}"
                 )
-            else:
-                tqdm.write(f"  [T{t+1}, Step {step: >4}] | CURR: {avg_acc*100:5.1f}%")
 
+                # C. Track Alignment
+                if top_eigs is not None:
+                    current_params = utils.get_flat_params(network)
+                    update_vec = current_params - previous_params
+                    
+                    if update_vec.norm() > 1e-12:
+                        # Returns list of scores [rank0, rank1...]
+                        # The util handles device check, but we moved eigs to device already
+                        scores = utils_landscape.compute_alignment(update_vec, top_eigs)
+                        alignment_history.append(scores)
+                    else:
+                        # Append zeros matching rank count
+                        alignment_history.append([0.0] * len(top_eigs))
+                        
+                    previous_params = current_params
+
+            else:
+                tqdm.write(f"  [T{t+1}, Step {step: >4}] | CURR: {avg_acc*100:5.1f}%" 
+                           f"Sharp: {avg_landscape.get('sharpness', 0):.4f}")
+
+        if t > 0: task_metrics['alignments_with_top_eigs'] = alignment_history
         results[t] = task_metrics
 
         # --- Post-Task Updates ---
@@ -147,7 +196,21 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
 
         # 3. Update Active Regularizer
         if training_mode == 'regularized':
-            active_regularizer.update(network, ds_reg, loss_fn, accumulate=config['accumulate'])
+            artifact_path = None
+            if t == 0: 
+                # Construct path: results/.../artifacts/task_0
+                # Using the config['save_path_slug'] we created earlier
+                save_path = os.path.join(config.get('output_dir', './results'), config.get('storage_folder', 'debug'), f"seed_{config.get('seed', 0)}")
+                artifact_path = os.path.join(save_path, 'artifacts', f'task_{t}')
+            
+            # Call Update with the path
+            active_regularizer.update(
+                network, 
+                ds_reg, 
+                loss_fn, 
+                accumulate=config['accumulate'],
+                save_path=artifact_path # <--- Pass the trigger
+            )
             
         # 4. Update Shadow Monitor
         shadow_monitor.update(network, ds_reg)
@@ -251,7 +314,7 @@ def main():
 
     # --- Environment ---
     env_args = config['environment_args']
-    env_args_obj = utils.MyArgs(**env_args)
+    env_args_obj = utils.Dict2Args(**env_args)
     
     env, env_name = environments.get_environment_from_name(
         config['environment'], env_args_obj
@@ -270,6 +333,15 @@ def main():
     def init_sched(optimizer):
         return utils.setup_scheduler(config['scheduler'], optimizer)
 
+    # --- Storage ---
+    # Generate the folder name dynamically
+    slug_name = make_config_slug(config)
+    # Structure: results / exp_name / param_string / seed_X
+    config['storage_folder'] = os.path.join(
+        config.get('exp_name', 'default'), 
+        slug_name
+    )
+
     # --- Run ---
     results = run_experiment_loop(
         config, env, init_net, init_opt, init_sched, 
@@ -278,13 +350,7 @@ def main():
 
     # --- Save ---
     save_config = config.copy()
-    # Generate the folder name dynamically
-    slug_name = make_config_slug(config)
-    # Structure: results / exp_name / param_string / seed_X
-    save_config['exp_name'] = os.path.join(
-        save_config.get('exp_name', 'default'), 
-        slug_name
-    )
+    
     
     utils_io.save_experiment_results(results, save_config, base_dir=args.output_dir)
 

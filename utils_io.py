@@ -5,16 +5,17 @@ import os
 from datetime import datetime
 import pickle
 
+
 def save_experiment_results(results, config, base_dir='results'):
     """
     Saves experiment results and config to disk.
     Structure: results/{exp_name}/{timestamp}_seed{seed}/
     """
-    exp_name = config.get('exp_name', 'default')
+    storage_folder = config.get('storage_folder', 'default')
     seed = config.get('seed', 0)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    save_path = os.path.join(base_dir, exp_name, f"seed_{seed}")
+    save_path = os.path.join(base_dir, storage_folder, f"seed_{seed}")
     os.makedirs(save_path, exist_ok=True)
     
     # Save Config

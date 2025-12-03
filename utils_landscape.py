@@ -77,3 +77,76 @@ def compute_grad_hessian_alignment(model, current_grad, regularizer):
         'alignment_energy': energy.item(),
         'alignment_top_eig': alignment
     }
+
+def get_total_curvature_from_regularizer(regularizer):
+    """
+    Aggregates per-sample importances into a single global curvature tensor.
+    Handles 'diag' (vector sum) and 'full/block' (matrix sum).
+    """
+    if not regularizer.per_sample_importances:
+        return None
+        
+    # Summing iteratively is memory-safer than stacking
+    # Start with the first one
+    total_curvature = regularizer.per_sample_importances[0].clone()
+    
+    # Add the rest
+    for i in range(1, len(regularizer.per_sample_importances)):
+        total_curvature += regularizer.per_sample_importances[i]
+        
+    return total_curvature
+
+def get_top_eigenvectors(matrix, k=1, structure='full'):
+    """
+    Returns the top-k eigenvectors of the aggregated curvature.
+    """
+    if structure == 'diag':
+        # matrix is 1D tensor (Diagonal). 
+        # Eigenvectors are canonical basis vectors at indices of largest elements.
+        top_indices = torch.topk(matrix, k).indices
+        
+        vectors = []
+        d = matrix.shape[0]
+        for idx in top_indices:
+            v = torch.zeros(d, device=matrix.device)
+            v[idx] = 1.0
+            vectors.append(v)
+        return torch.stack(vectors) # (k, d)
+
+    elif structure in ['full', 'block']:
+        # matrix is 2D. 
+        try:
+            # Use eigh for symmetric matrices (Fisher/Hessian are symmetric)
+            # Returns eigenvalues (ascending) and eigenvectors
+            L, V = torch.linalg.eigh(matrix)
+            
+            # Take last k columns (largest eigenvalues) and transpose to rows
+            top_vectors = V[:, -k:].T.flip(0) 
+            return top_vectors
+        except Exception as e:
+            print(f"Eigen-decomp failed: {e}")
+            return None
+            
+def compute_alignment(update_vector, eigen_vectors):
+    """
+    Computes cosine similarity between update and top eigenvectors.
+    """
+    # --- FIX: Ensure devices match ---
+    if eigen_vectors.device != update_vector.device:
+        eigen_vectors = eigen_vectors.to(update_vector.device)
+
+    # Normalize update to unit length
+    u_norm = update_vector / (update_vector.norm() + 1e-8)
+    
+    alignments = []
+    for v in eigen_vectors:
+        # v should be unit length, but be safe
+        v_norm = v / (v.norm() + 1e-8)
+        
+        # Absolute dot product (we care about alignment with the axis, +/- doesn't matter)
+        score = torch.dot(u_norm, v_norm).item()
+        alignments.append(score)
+        
+    return alignments
+
+

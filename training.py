@@ -1,4 +1,9 @@
 """ Training and evaluation functions for continual learning with quadratic regularizers."""
+import sys
+import os
+sys.path.append(os.path.abspath(".."))
+sys.path.append(os.path.abspath("."))
+
 import torch
 import numpy as np
 import bitbybit.utils as utils
@@ -17,6 +22,7 @@ def train_task(model, train_iterator, regularizer, optimizer, scheduler,
     
     # Store landscape metrics to average over the chunk
     landscape_metrics = []
+
 
     for step in range(num_steps):
         x, y, _ = next(train_iterator)

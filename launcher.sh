@@ -12,9 +12,9 @@ GPUS=(6 7)
 
 # Hyperparams
 SEEDS=(13 11 33)
-REG_TYPES=("taylor-full" "taylor-block" "taylor-diag")
+REG_TYPES=("taylor-full")
 ALPHAS=(1.0)
-MODES=("sequential" "regularized" "replay")
+MODES=("regularized" "sequential" "replay")
 
 # =====================
 
