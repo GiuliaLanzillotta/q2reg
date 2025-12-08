@@ -18,7 +18,10 @@ def train_task(model, train_iterator, regularizer, optimizer, scheduler,
                loss_fn, num_steps, device, landscape_interval=1):
     
     model.train()
-    avg_acc = 0.0
+    # Stats accumulators
+    total_acc = 0.0
+    total_task_loss = 0.0
+    total_reg_loss = 0.0
     
     # Store landscape metrics to average over the chunk
     landscape_metrics = []
@@ -37,48 +40,29 @@ def train_task(model, train_iterator, regularizer, optimizer, scheduler,
         total_loss = task_loss + reg_loss
         total_loss.backward()
         
-        # ---  Landscape Monitoring (Pre-Step) ---
-        # We do this before optimizer.step() to capture the gradient state
-        if step % landscape_interval == 0:
-            
-            # 1. Get Flat Gradient
-            g_flat = utils.get_flat_grad(model)
-            
-            # 2. Alignment with Past (H_accum)
-            if regularizer.past_samples: # Only if we have a regularizer active
-                align_res = utils_landscape.compute_grad_hessian_alignment(
-                    model, g_flat, regularizer
-                )
-            else:
-                align_res = {}
-            
-            # 3. Sharpness of Current Task
-            # Note: we use the current batch 'x' as a proxy for the task landscape
-            sharp_res = utils_landscape.compute_current_task_sharpness(
-                model, x, y, loss_fn
-            )
-            
-            # Merge and store
-            combined = {**align_res, **sharp_res}
-            landscape_metrics.append(combined)
-        # --------------------------------------------
 
         optimizer.step()
         scheduler[0].step()
         
-        acc = (output.argmax(1) == y).float().mean().item()
-        avg_acc += acc
+        # 5. Track Basic Stats
+        total_task_loss += task_loss.item()
+        total_reg_loss += reg_loss
+        acc = (output.argmax(dim=1) == y).float().mean().item()
+        total_acc += acc
 
-    avg_acc /= num_steps
+
+
+    # Return averaged stats
+    avg_acc = total_acc / num_steps
+    avg_task_loss = total_task_loss / num_steps
+    avg_reg_loss = total_reg_loss / num_steps
+
+    # if it's a tensor, convert to float
+    if torch.is_tensor(avg_reg_loss):
+        avg_reg_loss = avg_reg_loss.item()
     
-    # Aggregate landscape metrics (mean) for this chunk
-    avg_landscape = {}
-    if landscape_metrics:
-        keys = landscape_metrics[0].keys()
-        for k in keys:
-            avg_landscape[k] = sum(d.get(k, 0) for d in landscape_metrics) / len(landscape_metrics)
+    return avg_acc,  avg_task_loss, avg_reg_loss
 
-    return avg_acc, avg_landscape
 
 @torch.enable_grad() # Ensure gradients are computed for this function
 def evaluate_past_metrics(model, regularizer, loss_fn, device):
@@ -192,3 +176,33 @@ def evaluate_on_all_past(model, replay_buffer, loss_fn, device):
     mean_accuracy = np.sum(all_corrects) / total_samples
     
     return {'mean_loss': mean_loss, 'mean_accuracy': mean_accuracy}
+
+
+def track_geometry_dynamics(model, top_eigs, previous_params, task_anchor_params):
+    """
+    Computes geometric interactions between the model's movement and the 
+    regularizer's forbidden directions.
+    
+    Returns:
+        align_scores: Cosine alignment of the update step (Velocity).
+        proj_scores: Scalar projection of total displacement (Drift).
+        current_params: The current flat parameters (to update state).
+    """
+    current_params = utils.get_flat_params(model)
+    
+    # 1. ALIGNMENT (Velocity)
+    # "Are we moving in the forbidden direction right now?"
+    update_vec = current_params - previous_params
+    
+    if update_vec.norm() > 1e-12:
+        align_scores = utils_landscape.compute_alignment(update_vec, top_eigs)
+    else:
+        align_scores = [0.0] * len(top_eigs)
+
+    # 2. PROJECTION (Position / Drift)
+    # "How far have we drifted from the start of the task along this axis?"
+    # Note: We use (current - task_start), NOT (current - previous)
+    displacement = current_params - task_anchor_params
+    proj_scores = utils_landscape.compute_projection(displacement, top_eigs)
+    
+    return align_scores, proj_scores, current_params

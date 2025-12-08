@@ -17,7 +17,7 @@ import utils_math
 def get_regularizer(config):
     reg_name = config['reg_type']
     alpha = config['alpha']
-    curv_type = config.get('curvature', 'hessian')
+    curv_type = config.get('curvature_type', 'hessian')
     
     # NEW: Read flag, default to False
     ignore_grad = config.get('ignore_gradient', False) 

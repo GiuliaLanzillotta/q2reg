@@ -8,13 +8,14 @@ CONFIG="config_2D_classification.yaml"
 EXP_NAME="study_q2approx_v1"
 
 # Define available GPUs
-GPUS=(6 7) 
+GPUS=(1 2) 
 
 # Hyperparams
 SEEDS=(13 11 33)
-REG_TYPES=("taylor-full")
+REG_TYPES=("taylor-block" "taylor-diag" "taylor-full")
 ALPHAS=(1.0)
 MODES=("regularized" "sequential" "replay")
+GRAD=("True" "False")
 
 # =====================
 
@@ -59,7 +60,7 @@ for seed in "${SEEDS[@]}"; do
                 while [[ $(jobs -r -p | wc -l) -ge $NUM_GPUS ]]; do
                     wait -n 2>/dev/null || wait
                 done
-
+                
             done
         done
     done

@@ -80,13 +80,18 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
             train_loader = task_loader
             
         task_iterator = itertools.cycle(train_loader)
-        task_metrics = {'history': [], 'landscape': []}
+        task_metrics = {'history': [], 'landscape': [], 'performance': []}
 
         # --- Setup Alignment Tracking (Using Shadow Monitor as Reference) ---
         top_eigs = None
         alignment_history = []
+        projection_history = []
+        task_anchor_params = utils.get_flat_params(network).clone()
         previous_params = utils.get_flat_params(network) # Initialize outside loop
         if t > 0:
+
+            print("Computing top eigenvectors of regularizer for alignment check...")
+            
             # We use the shadow monitor (Accumulate) as the "Ground Truth" for geometry
             # This works for Sequential, Replay, AND Regularized modes!
             ref_reg = shadow_monitor.reg_accum
@@ -113,31 +118,55 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
         
         # Initial Eval (Task 0 has no past, so skip)
         if t > 0:
+            # sanity check, this should be zero 
             monitor_stats = utils_monitor.evaluate_shadow_monitors(network, shadow_monitor, device)
             past_metrics_all = training.evaluate_on_all_past(network, replay_buffer, loss_fn, device)
             
             acc_reg = np.mean([m['accuracy'] for m in monitor_stats])
             tqdm.write(
-                f"  [T{t+1}, PRE] | "
+                f"  [T{t+1}, PRE]+ | "
                 f"PAST-ALL Acc: {past_metrics_all['mean_accuracy']*100:6.2f}% | "
                 f"PAST-REG Acc: {acc_reg*100:6.2f}%"
             )
+            # C. Track Alignment
+            if top_eigs is not None:
+                align_scores, proj_scores, previous_params = training.track_geometry_dynamics(
+                    network, 
+                    top_eigs, 
+                    previous_params, 
+                    task_anchor_params
+                )
+                
+                alignment_history.append(align_scores)
+                projection_history.append(proj_scores)
 
-            print("Computing top eigenvectors of regularizer for alignment check...")
-    
 
         for chunk_idx in tqdm(range(num_chunks), desc=f'Task {t} ({training_mode})'):
             
             # A. Train Step
-            avg_acc, avg_landscape = training.train_task(
+            avg_acc, avg_task_loss, avg_reg_loss = training.train_task(
                 network, task_iterator, active_regularizer, optimizer, 
                 scheduler, loss_fn, config['log_every_n_steps'], device
             )
-            # Landscape Stats
-            task_metrics['landscape'].append(avg_landscape)
+            perf_dict = {'accuracy': avg_acc, 'task_loss': avg_task_loss, 'reg_loss': avg_reg_loss}
             
             step = (chunk_idx + 1) * config['log_every_n_steps']
             
+            # Landscape Stats
+            if chunk_idx % config['landscape_interval'] == 0:
+                landscape_stats = utils_landscape.evaluate_landscape_sharpness(
+                    network, task_data, shadow_monitor, loss_fn, device
+                )
+                
+                # Also compute Gradient Norms here if you moved them out of train_task
+                # (Optional, but keeps train_task pure)
+                grad_stats = utils_landscape.compute_gradient_stats(network, shadow_monitor.reg_accum, loss_fn, task_data, device)
+                
+                # Merge
+                full_landscape_stats = {**landscape_stats, **grad_stats}
+                task_metrics['landscape'].append(full_landscape_stats)
+                
+
             # B. Evaluate & Log
             if t > 0:
                 # Monitor Stats (Past Reg samples)
@@ -152,35 +181,40 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
 
                 acc_reg = np.mean([m['accuracy'] for m in monitor_stats])
                 
+
+
                 tqdm.write(
                     f"  [T{t+1}, Step {step: >4}] | "
                     f"CURR: {avg_acc*100:5.1f}% | "
                     f"ALL: {past_metrics_all['mean_accuracy']*100:5.1f}% | "
                     f"REG: {acc_reg*100:5.1f}% | "
-                    f"Sharp: {avg_landscape.get('sharpness', 0):.4f}"
+                    f"Sharp: {landscape_stats.get('sharpness_curr', 0):.4f}"
                 )
+
+                perf_dict['all_accuracy'] = past_metrics_all['mean_accuracy']
+                perf_dict['reg_accuracy'] = acc_reg
 
                 # C. Track Alignment
                 if top_eigs is not None:
-                    current_params = utils.get_flat_params(network)
-                    update_vec = current_params - previous_params
+                    align_scores, proj_scores, previous_params = training.track_geometry_dynamics(
+                        network, 
+                        top_eigs, 
+                        previous_params, 
+                        task_anchor_params
+                    )
                     
-                    if update_vec.norm() > 1e-12:
-                        # Returns list of scores [rank0, rank1...]
-                        # The util handles device check, but we moved eigs to device already
-                        scores = utils_landscape.compute_alignment(update_vec, top_eigs)
-                        alignment_history.append(scores)
-                    else:
-                        # Append zeros matching rank count
-                        alignment_history.append([0.0] * len(top_eigs))
-                        
-                    previous_params = current_params
+                    alignment_history.append(align_scores)
+                    projection_history.append(proj_scores)
 
             else:
                 tqdm.write(f"  [T{t+1}, Step {step: >4}] | CURR: {avg_acc*100:5.1f}%" 
-                           f"Sharp: {avg_landscape.get('sharpness', 0):.4f}")
+                           f"Sharp: {landscape_stats.get('sharpness_curr', 0):.4f}")
 
-        if t > 0: task_metrics['alignments_with_top_eigs'] = alignment_history
+        task_metrics['performance'].append(perf_dict)
+
+        if t > 0: 
+            task_metrics['alignments_with_top_eigs'] = alignment_history
+            task_metrics['projections_along_top_eigs'] = projection_history
         results[t] = task_metrics
 
         # --- Post-Task Updates ---
