@@ -103,13 +103,15 @@ def make_hessian_psd(H, mode='abs'):
     H_psd = Q @ (torch.diag(L_new) @ Q.T)
     
     return H_psd
+import torch
+from torch.func import functional_call, hessian, grad, vmap
 
 def compute_loss_grad_curvature(model, loss_fn, x, y, params_flat=None, curvature_type='hessian'):
     """
     Computes Loss, Gradient, and Curvature Matrix (H).
-    curvature_type: 'hessian' (True 2nd derivative) or 'fisher' (Gradient outer product)
+    curvature_type: 'hessian', 'fisher' (Empirical), or 'true_fisher' (Analytical)
     """
-    # 1. Setup Parameters & Device (Same as before)
+    # 1. Setup Parameters & Device
     if params_flat is None:
         params_dict = dict(model.named_parameters())
         device = next(model.parameters()).device
@@ -119,27 +121,24 @@ def compute_loss_grad_curvature(model, loss_fn, x, y, params_flat=None, curvatur
 
     x = x.to(device)
     y = y.to(device)
+    
+    # Ensure x is a batch for vmap
+    if x.dim() == 1: x = x.unsqueeze(0)
+    if y.dim() == 0: y = y.unsqueeze(0)
 
-    # 2. Define Functional Loss
+    # 2. Define Functional Loss (Batch)
     def func_loss(p_dict):
-        x_in = x.unsqueeze(0) if x.dim() == 1 else x
-        y_in = y.unsqueeze(0) if y.dim() == 0 else y
-        out = functional_call(model, p_dict, (x_in,))
-        return loss_fn(out, y_in)
+        out = functional_call(model, p_dict, (x,))
+        return loss_fn(out, y)
 
     def func_loss_aux(p_dict):
-        x_in = x.unsqueeze(0) if x.dim() == 1 else x
-        y_in = y.unsqueeze(0) if y.dim() == 0 else y
-        
-        out = functional_call(model, p_dict, (x_in,))
-        loss = loss_fn(out, y_in)
-        return loss, loss # Return loss as auxiliary data
+        out = functional_call(model, p_dict, (x,))
+        loss = loss_fn(out, y)
+        return loss, loss
 
-    # 4. Compute Gradient and Loss
-    # Use grad(..., has_aux=True) to get both gradient and value
+    # 3. Compute Gradient (of the actual Loss)
     g_dict, loss_val = grad(func_loss_aux, has_aux=True)(params_dict)
     
-    # Flatten Gradient
     keys = list(params_dict.keys())
     g_flat = torch.cat([g_dict[k].view(-1) for k in keys])
     
@@ -147,8 +146,6 @@ def compute_loss_grad_curvature(model, loss_fn, x, y, params_flat=None, curvatur
     if curvature_type == 'hessian':
         # --- A. True Hessian ---
         H_dict = hessian(func_loss)(params_dict)
-        
-        # Flatten Hessian (Block Reconstruction)
         h_rows = []
         for k1 in keys:
             row_blocks = []
@@ -160,55 +157,55 @@ def compute_loss_grad_curvature(model, loss_fn, x, y, params_flat=None, curvatur
                 row_blocks.append(block)
             h_rows.append(torch.cat(row_blocks, dim=1))
         H_full = torch.cat(h_rows, dim=0)
-        
-        # Maybe: Apply PSD correction to Hessian
-        # H_full = make_hessian_psd(H_full)
 
     elif curvature_type == 'fisher':
-        # --- B. Empirical Fisher ---
-        # F = g * g^T (Outer Product)
-        # This is guaranteed PSD by definition.
+        # --- B. Empirical Fisher (Rank 1 Estimate) ---
+        # Note: This computes the outer product of the MEAN gradient.
+        # This is strictly Rank 1. Use with caution for Spectral Reg.
         H_full = torch.outer(g_flat, g_flat)
+
+    elif curvature_type == 'true_fisher':
+        # --- C. True Fisher (Expectation over Model Probabilities) ---
+        # F = E_y [ \nabla log p(y|x) \nabla log p(y|x)^T ]
         
+        # 1. Get Model Probabilities p(c|x)
+        with torch.no_grad():
+            logits = functional_call(model, params_dict, (x,))
+            probs = torch.softmax(logits, dim=1) # [N, C]
+            num_classes = probs.shape[1]
+            batch_size = x.shape[0]
+
+        H_accum = 0
+        
+        # Define per-sample loss for a specific target class 'c'
+        def func_loss_for_class_c(p_d, x_i, c_idx):
+            out = functional_call(model, p_d, (x_i.unsqueeze(0),))
+            # Create a dummy target just for gradient calculation
+            t = torch.tensor([c_idx], device=x_i.device)
+            return loss_fn(out, t)
+
+        # 2. Sum over all classes
+        for c in range(num_classes):
+            # A. Compute gradients for class 'c' for ALL samples in batch (vmap)
+            # grad return dict -> flatten it
+            compute_grad = grad(func_loss_for_class_c)
+            g_dict_c = vmap(compute_grad, in_dims=(None, 0, None))(params_dict, x, c)
+            g_flat_c = torch.cat([g_dict_c[k].flatten(start_dim=1) for k in keys], dim=1) # [N, D]
+            
+            # B. Weight by sqrt(probability)
+            # p_c is [N] -> [N, 1]
+            p_c = probs[:, c].view(-1, 1)
+            
+            # C. Accumulate weighted outer product
+            # sum_i ( p(c|x_i) * g_i * g_i^T )
+            # Efficiently: (sqrt(p)*g)^T @ (sqrt(p)*g)
+            g_weighted = g_flat_c * torch.sqrt(p_c)
+            H_accum += (g_weighted.T @ g_weighted)
+            
+        # 3. Average over batch
+        H_full = H_accum / batch_size
+
     else:
         raise ValueError(f"Unknown curvature type: {curvature_type}")
 
     return loss_val, g_flat, H_full
-
-def compute_loss_and_grad(model, loss_fn, x, y, params_flat=None):
-    """
-    Computes Loss and Gradient efficiently.
-    Ensures inputs match the device of the parameters.
-    """
-    # 1. Prepare parameters & Determine Device
-    if params_flat is None:
-        params_dict = dict(model.named_parameters())
-        device = next(model.parameters()).device
-    else:
-        params_dict = get_params_dict_from_flat(model, params_flat)
-        device = params_flat.device
-
-    # 2. Ensure Inputs are on the Correct Device
-    x = x.to(device)
-    y = y.to(device)
-
-    # 3. Define Functional Loss with Auxiliary Output
-    # We return (loss, loss) so that 'grad' can return (grads, loss)
-    def func_loss_aux(p_dict):
-        x_in = x.unsqueeze(0) if x.dim() == 1 else x
-        y_in = y.unsqueeze(0) if y.dim() == 0 else y
-        
-        out = functional_call(model, p_dict, (x_in,))
-        loss = loss_fn(out, y_in)
-        return loss, loss # Return loss as auxiliary data
-
-    # 4. Compute Gradient and Value simultaneously
-    # has_aux=True tells PyTorch the function returns (output, aux)
-    # output is differentiated, aux is just returned pass-through.
-    g_dict, loss_val = grad(func_loss_aux, has_aux=True)(params_dict)
-    
-    # 5. Flatten Gradient
-    keys = [k for k, _ in model.named_parameters()]
-    g_flat = torch.cat([g_dict[k].view(-1) for k in keys])
-    
-    return loss_val, g_flat

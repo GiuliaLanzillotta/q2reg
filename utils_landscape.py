@@ -40,11 +40,22 @@ def compute_current_task_sharpness(model, x, y, loss_fn):
     
     
     # Compute Eigenvalues (Symmetric)
-    eigvals = torch.linalg.eigvalsh(H_full)
+    _, eigvals, _ = torch.linalg.svd(H_full)
+
+    # 3. Compute Numerical Rank
+    # Floating point math is noisy, so we don't check > 0.0.
+    # We check if values are > threshold (e.g. 0.0001% of the max eigenvalue).
+    max_abs_eig = torch.max(torch.abs(eigvals))
+    tolerance = max_abs_eig * 1e-6 if max_abs_eig > 0 else 1e-6
+    
+    # Count how many eigenvalues represent "real" curvature info
+    rank = (eigvals.abs() > tolerance).sum().item()
     
     return {
         'sharpness': eigvals[-1].item(),
-        'trace': eigvals.sum().item()
+        'trace': eigvals.sum().item(),
+        'rank': int(rank),
+        'rank_fraction': rank / len(eigvals) # Percentage of dimensions that are active
     }
 
 def compute_past_sharpness(model, regularizer, loss_fn, sample_limit=200):
@@ -53,7 +64,7 @@ def compute_past_sharpness(model, regularizer, loss_fn, sample_limit=200):
     Reuses compute_current_task_sharpness.
     """
     if not regularizer.past_samples:
-        return {'sharpness_past': 0.0, 'trace_past': 0.0}
+        return {'sharpness_past': 0.0, 'trace_past': 0.0, 'rank_past': 0, 'rank_fraction_past': 0.0}
     
     device = next(model.parameters()).device
     
@@ -79,7 +90,9 @@ def compute_past_sharpness(model, regularizer, loss_fn, sample_limit=200):
     # Rename keys for clarity in logs
     return {
         'sharpness_past': res['sharpness'], 
-        'trace_past': res['trace']
+        'trace_past': res['trace'],
+        'rank_past': res['rank'],
+        'rank_fraction_past': res['rank_fraction']
     }
 
 def compute_grad_hessian_alignment(model, current_grad, regularizer):
@@ -152,22 +165,27 @@ def get_total_curvature_from_regularizer(regularizer):
         
     return total_curvature
 
-def get_top_eigenvectors(matrix, k=1, structure='full'):
+def get_top_eigenvectors(matrix, k=1, structure='full', tol = 1e-6):
     """
     Returns the top-k eigenvectors of the aggregated curvature.
     """
+    
     if structure == 'diag':
         # matrix is 1D tensor (Diagonal). 
+
+        # matrix is 1D tensor [D]
+        # A. Compute Rank (Count of non-zero elements)
+        rank = (matrix.abs() > tol).sum().item()
+
         # Eigenvectors are canonical basis vectors at indices of largest elements.
         top_indices = torch.topk(matrix, k).indices
-        
         vectors = []
         d = matrix.shape[0]
         for idx in top_indices:
             v = torch.zeros(d, device=matrix.device)
             v[idx] = 1.0
             vectors.append(v)
-        return torch.stack(vectors) # (k, d)
+        return torch.stack(vectors), rank # (k, d)
 
     elif structure in ['full', 'block']:
         # matrix is 2D. 
@@ -175,13 +193,14 @@ def get_top_eigenvectors(matrix, k=1, structure='full'):
             # Use eigh for symmetric matrices (Fisher/Hessian are symmetric)
             # Returns eigenvalues (ascending) and eigenvectors
             L, V = torch.linalg.eigh(matrix)
+            rank = (L.abs() > tol).sum().item()
             
             # Take last k columns (largest eigenvalues) and transpose to rows
             top_vectors = V[:, -k:].T.flip(0) 
-            return top_vectors
+            return top_vectors, rank
         except Exception as e:
             print(f"Eigen-decomp failed: {e}")
-            return None
+            return None, None
             
 def compute_alignment(update_vector, eigen_vectors):
     """
@@ -206,7 +225,7 @@ def compute_alignment(update_vector, eigen_vectors):
     return alignments
 
 
-def evaluate_landscape_sharpness(model, task_data, shadow_monitor, loss_fn, device, sample_size=32):
+def evaluate_landscape_sharpness(model, task_data, shadow_monitor, loss_fn, device, sample_size=200):
     """
     Evaluates the local geometry (Hessian Sharpness) on:
     1. The Current Task (using a random subset of task_data)
@@ -230,6 +249,8 @@ def evaluate_landscape_sharpness(model, task_data, shadow_monitor, loss_fn, devi
     
     metrics['sharpness_curr'] = res_curr['sharpness']
     metrics['trace_curr'] = res_curr['trace']
+    metrics['rank_curr'] = res_curr['rank']
+    metrics['rank_fraction_curr'] = res_curr['rank_fraction']
     
     # --- 2. PAST TASK SHARPNESS ---
     # We use the Accumulate Monitor as the source of truth for "Past Constraints"
@@ -242,10 +263,14 @@ def evaluate_landscape_sharpness(model, task_data, shadow_monitor, loss_fn, devi
         res_past = compute_past_sharpness(model, past_reg, loss_fn, sample_limit=sample_size)
         
         metrics['sharpness_past'] = res_past['sharpness_past']
-        metrics['trace_past'] = res_past.get('trace_past', 0.0)
+        metrics['trace_past'] = res_past['trace_past']
+        metrics['rank_past'] = res_past['rank_past']
+        metrics['rank_fraction_past'] = res_past['rank_fraction_past']
     else:
         metrics['sharpness_past'] = 0.0
         metrics['trace_past'] = 0.0
+        metrics['rank_past'] = 0.0
+        metrics['rank_fraction_past'] = 0.0
         
     return metrics
 

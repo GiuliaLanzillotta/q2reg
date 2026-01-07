@@ -18,6 +18,11 @@ def get_regularizer(config):
     reg_name = config['reg_type']
     alpha = config['alpha']
     curv_type = config.get('curvature_type', 'hessian')
+    # NEW: Read flag
+    spectral_override = config.get('spectral_override', False)
+    spectral_threshold = config.get('spectral_threshold', 0.999)
+    spectral_rank = config.get('spectral_rank', 50)
+    hard_spectral_cut = config.get('hard_spectral_cut', False)
     
     # NEW: Read flag, default to False
     ignore_grad = config.get('ignore_gradient', False) 
@@ -25,7 +30,7 @@ def get_regularizer(config):
     if reg_name == 'ewc':
         # EWC classically ignores gradient, but our impl allowed it.
         # Let's support the flag here too.
-        return EWCRegularizer(alpha=alpha, ignore_gradient=ignore_grad)
+        return EWCRegularizer(alpha=alpha, ignore_gradient=ignore_grad, spectral_override=spectral_override, spectral_threshold=spectral_threshold, spectral_rank=spectral_rank, hard_spectral_cut=hard_spectral_cut)
         
     if 'taylor' in reg_name:
         if 'diag' in reg_name: struct = 'diag'
@@ -36,8 +41,13 @@ def get_regularizer(config):
             alpha=alpha, 
             structure=struct, 
             curvature_type=curv_type, 
-            ignore_gradient=ignore_grad 
+            ignore_gradient=ignore_grad, 
+            spectral_override=spectral_override, 
+            spectral_threshold=spectral_threshold, 
+            spectral_rank=spectral_rank,
+            hard_spectral_cut=hard_spectral_cut
         )
+    
     
     raise ValueError(f"Unknown reg_type: {reg_name}")
 
@@ -46,10 +56,11 @@ class BaseRegularizer(ABC):
     Abstract Base Class for a quadratic regularizer.
     Stores per-sample contributions \Lambda_i and the anchor \vparam_{t-1}.
     """
-    def __init__(self, alpha, structure='diag'):
+    def __init__(self, alpha, structure='diag', **kwargs):
         self.alpha = alpha
         self.structure = structure # 'diag', 'full', 'block'
         self.anchor_param_list = [] 
+        self.global_basis = None
         
         # --- Lists for per-sample data ---
         # Stores \Lambda_i for each sample
@@ -64,6 +75,17 @@ class BaseRegularizer(ABC):
         self.past_sample_peak_acc = []
         # Stores the *index* k from anchor_param_list for each sample i
         self.past_sample_anchor_idx = []
+        # Pre-computed map of {anchor_idx: [sample_indices...]}
+        self.anchor_groups = {}
+        # Structure: { anchor_idx: V_k_matrix }
+        self.spectral_cache = {}
+
+        # --- Spectral Regularization ---
+        self.spectral_override = kwargs.get('spectral_override', False)
+        self.spectral_threshold = kwargs.get('spectral_threshold', 0.999)
+        self.spectral_rank = kwargs.get('spectral_rank', 50)
+        self.hard_spectral_cut = kwargs.get('hard_spectral_cut', False)
+
 
     def _compute_quadratic_form(self, delta, lambda_i, g_i):
         """Computes the quadratic form \delta^T \Lambda_i \delta"""
@@ -77,27 +99,82 @@ class BaseRegularizer(ABC):
             raise ValueError(f"Unknown structure: {self.structure}")
 
     def compute_total_reg_loss(self, model):
-        """Computes the total regularization loss \alpha * \sum_i \hat\loss_i(\vparam)"""
-        if self.anchor_param_list is None:
+        """
+        Computes regularization loss. 
+        If spectral_override=True, uses the cached subspace V_k from update().
+        """
+        if not self.anchor_param_list:
             return torch.tensor(0.0, device=next(model.parameters()).device)
 
         current_params = utils.get_flat_params(model)
-        total_loss = 0.0
+        device = current_params.device
         
-        # Iterate sample by sample, using the correct anchor for each
-        for i in range(len(self.past_samples)):
-            lambda_i = self.per_sample_importances[i].to(current_params.device)
-            g_i = self.per_sample_grads[i].to(current_params.device)
-
-            # --- Get the sample-specific anchor ---
-            anchor_k_idx = self.past_sample_anchor_idx[i]
-            anchor_k = self.anchor_param_list[anchor_k_idx].to(current_params.device)
+        # --- PATH A: FAST SPECTRAL REGULARIZATION ---
+        if self.spectral_override:
+            total_spectral_loss = 0.0
             
-            delta = current_params - anchor_k
+            # Iterate over the CACHE, which is grouped by anchor
+            for anchor_idx, V_k_cpu in self.spectral_cache.items():
+                
+                # 1. Get Anchor & Delta
+                # Move V_k to GPU just-in-time
+                V_k = V_k_cpu.to(device)
+                anchor_k = self.anchor_param_list[anchor_idx].to(device)
+                
+                delta = current_params - anchor_k
+                
+                # 2. Project Delta: || V_k^T delta ||^2
+                # O(k * D) operation (Fast Matrix-Vector product)
+                projected_delta = V_k.T @ delta
+                
+                loss_component = torch.sum(projected_delta ** 2)
+                total_spectral_loss += loss_component
 
-            total_loss += self._compute_quadratic_form(delta, lambda_i, g_i)
+            return self.alpha * total_spectral_loss
+
+        # --- PATH B: STANDARD REGULARIZATION ---
+        # (Your existing code for sum-of-quadratics)
+        total_loss = 0.0
+        for anchor_idx, sample_indices in self.anchor_groups.items():
+            anchor_k = self.anchor_param_list[anchor_idx].to(device)
+            delta = current_params - anchor_k
+            
+            for i in sample_indices:
+                lambda_i = self.per_sample_importances[i].to(device)
+                g_i = self.per_sample_grads[i].to(device)
+                total_loss += self._compute_quadratic_form(delta, lambda_i, g_i)
             
         return self.alpha * total_loss
+    
+    @torch.no_grad()
+    def project_weights(self, model, previous_params_flat):
+        """
+        Projects the parameter update onto the null space of the Global Basis.
+        """
+        if self.global_basis is None:
+            return
+
+        current_params = utils.get_flat_params(model)
+        
+        # 1. Get Basis (Move to GPU for operation)
+        U = self.global_basis.to(current_params.device)
+        
+        # 2. Calculate Update (Drift)
+        # delta = w_new - w_old
+        delta = current_params - previous_params_flat
+        print(f"Update magnitude before projection: {torch.norm(delta).item():.6f}")
+        
+        # 3. Project Delta onto Forbidden Subspace
+        # forbidden = U @ (U.T @ delta)
+        inner = U.T @ delta
+        forbidden = U @ inner
+        
+        # 4. Remove Forbidden Component
+        # w_corrected = w_new - forbidden
+        current_params.sub_(forbidden)
+        new_delta = current_params - previous_params_flat
+        print(f"Update magnitude after projection: {torch.norm(new_delta).item():.6f}")
+        utils.set_flat_params(model, current_params)
 
     def compute_per_sample_proxy_loss(self, model, sample_index):
         """Computes the proxy loss \hat\loss_{i|t-1}(\vparam) for a single sample i."""
@@ -172,6 +249,7 @@ class BaseRegularizer(ABC):
             # Add this as a new, permanent anchor
             self.anchor_param_list.append(new_anchor_params)
             new_anchor_idx = len(self.anchor_param_list) - 1
+            self.anchor_groups[new_anchor_idx] = []
             
             for x, y, _ in task_dataset:
                 x, y = x.unsqueeze(0), y.unsqueeze(0)
@@ -192,13 +270,16 @@ class BaseRegularizer(ABC):
                 self.past_samples.append((x.clone().detach().cpu(), y.clone().detach().cpu()))
                 self.past_sample_peak_acc.append(peak_acc)
                 self.past_sample_anchor_idx.append(new_anchor_idx)
+                self.anchor_groups[new_anchor_idx].append(len(self.per_sample_importances)-1)
 
         else:
+            print("Resetting the regularizer")
             # --- GLOBAL, RESETTING ANCHOR ---
             # Set this as the *only* anchor
             self.anchor_param_list = [new_anchor_params]
+            self.anchor_groups = {}
             new_anchor_idx = 0
-            
+            self.anchor_groups[new_anchor_idx] = []
             # Rebuild importances and anchor indices
             new_importances = []
             new_grads = []
@@ -214,6 +295,7 @@ class BaseRegularizer(ABC):
                 new_losses.append(l_i.cpu())
                 new_anchor_indices.append(new_anchor_idx)
                 # self.past_samples[i] and self.past_sample_peak_acc[i] are preserved
+                self.anchor_groups[new_anchor_idx].append(len(new_importances)-1)
             
             # 2. Compute for *new* samples
             for x, y, _ in task_dataset:
@@ -234,6 +316,7 @@ class BaseRegularizer(ABC):
                 new_anchor_indices.append(new_anchor_idx)
                 self.past_samples.append((x.clone().detach().cpu(), y.clone().detach().cpu()))
                 self.past_sample_peak_acc.append(peak_acc)
+                self.anchor_groups[new_anchor_idx].append(len(new_importances)-1)
 
             # Replace the old lists
             self.per_sample_importances = new_importances
@@ -241,8 +324,126 @@ class BaseRegularizer(ABC):
             self.per_sample_losses = new_losses
             self.past_sample_anchor_idx = new_anchor_indices
 
+
+        if self.spectral_override and self.structure in ['full', 'block']:
+            self.precompute_spectral_subspaces()
+
         if save_path is not None:
             self.save_artifacts(save_path)
+
+    def precompute_spectral_subspaces(self):
+        """
+        Groups samples by anchor, aggregates their Fisher matrices, 
+        and caches the top-k subspace (V_k) for fast projection.
+        """
+        if not self.per_sample_importances:
+            return
+        if self.hard_spectral_cut:
+            print(f"  [Regularizer] Pre-computing spectral subspaces (Rank={self.spectral_rank})...")
+        else:
+            print(f"  [Regularizer] Pre-computing spectral subspaces (Threshold={self.spectral_threshold})...")
+
+        # 2. Compute and Cache
+        self.spectral_cache = {}
+        
+        # We determine device from the first stored tensor
+        # (Assuming tensors are on CPU to save memory, we move to GPU for SVD)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        for anchor_idx, sample_indices in self.anchor_groups.items():
+            # A. Aggregate Curvature
+            # Stack only what we need to minimize RAM usage
+            lambdas_stack = torch.stack([
+                self.per_sample_importances[i] for i in sample_indices
+            ]).to(device)
+            
+            F_total = torch.sum(lambdas_stack, dim=0)
+            
+            # B. Decompose
+            # eigh is faster/stable for symmetric matrices
+            L, V = torch.linalg.eigh(F_total)
+            L = L.flip(0) # Descending
+            V = V.flip(1)
+            
+            # --- Capture Sharpness ---
+            # We clip at 0 to avoid numerical errors with negative eigenvalues
+            lambda_max = torch.clamp(L[0], min=1e-8)
+            
+            if self.hard_spectral_cut: 
+                k = self.spectral_rank
+            else: 
+                # C. Threshold
+                total_energy = L.sum()
+                target_energy = self.spectral_threshold * total_energy
+                cumulative_energy = torch.cumsum(L, dim=0)
+                
+                k = torch.searchsorted(cumulative_energy, target_energy).item() + 1
+                k = min(k, len(L))
+            
+
+            # D. Cache V_k
+            V_k = V[:, :k]
+
+            # SCALE THE BASIS:
+            # We multiply by sqrt(lambda_max) so that when we compute norm(V.T @ x)^2,
+            # the effective penalty magnitude matches the actual sharpness.
+            scale_factor = torch.sqrt(lambda_max)
+            V_k_scaled = V_k * scale_factor
+
+            # Store on CPU to avoid holding GPU memory during training
+            self.spectral_cache[anchor_idx] = V_k_scaled.cpu()
+
+
+            
+            print(f"    Anchor {anchor_idx}: Cached Subspace Rank {k} with scale factor {scale_factor:.2f}")
+                #   f"({cumulative_energy[k-1]/total_energy:.2%} energy)")
+        
+        # 3. BUILD GLOBAL BASIS (For Hard Projection)
+        # We compute this once here so the training loop is fast.
+        self._update_global_basis(device)
+
+        # Cleanup GPU memory used for SVD
+        if device == 'cuda':
+            del lambdas_stack, F_total, L, V
+            torch.cuda.empty_cache()
+
+    def _update_global_basis(self, device):
+        """
+        Combines all cached subspaces into a single orthonormal basis (Q).
+        Required for correct Hard Projection (GPM style).
+        """
+        if not self.spectral_cache:
+            self.global_basis = None
+            return
+
+        print("  [Regularizer] Building Global Orthogonal Basis (QR)...")
+        
+        # 1. Collect all vectors
+        all_vectors = []
+        for V_k in self.spectral_cache.values():
+            if V_k.shape[1] > 0:
+                V_k = V_k.to(device)
+                
+                # CRITICAL: Re-Normalize!
+                # We stored them as V * sqrt(lambda). 
+                # For geometric projection, we need unit vectors.
+                # Norm columns to 1.0
+                V_norm = V_k / (torch.norm(V_k, dim=0, keepdim=True) + 1e-8)
+                all_vectors.append(V_norm)
+        
+        if not all_vectors:
+            self.global_basis = None
+            return
+
+        # 2. Concatenate [D, Total_K]
+        V_matrix = torch.cat(all_vectors, dim=1)
+        
+        # 3. QR Decomposition
+        # Q is [D, Rank_Union], orthonormal
+        Q, _ = torch.linalg.qr(V_matrix, mode='reduced')
+        
+        self.global_basis = Q.cpu() # Store on CPU
+        print(f"  [Regularizer] Global Basis Ready. Total Rank: {Q.shape[1]}")
 
     def reset(self):
         """Resets regularizer state completely."""
@@ -289,9 +490,9 @@ class BaseRegularizer(ABC):
 class EWCRegularizer(BaseRegularizer):
     """Elastic Weight Consolidation (EWC) regularizer."""
     
-    def __init__(self, alpha):
+    def __init__(self, alpha, **kwargs):
         # EWC is by definition diagonal
-        super().__init__(alpha, structure='diag')
+        super().__init__(alpha, structure='diag', **kwargs)
 
     def _compute_importance_and_grad(self, model, x, y, anchor_params_flat, loss_fn):
         
@@ -317,8 +518,8 @@ class EWCRegularizer(BaseRegularizer):
 # In regularizers.py
 
 class TaylorRegularizer(BaseRegularizer):
-    def __init__(self, alpha, structure='diag', curvature_type='hessian', ignore_gradient=False):
-        super().__init__(alpha, structure)
+    def __init__(self, alpha, structure='diag', curvature_type='hessian', ignore_gradient=False, **kwargs):
+        super().__init__(alpha, structure, **kwargs)
         self.curvature_type = curvature_type
         self.ignore_gradient = ignore_gradient # <--- Store flag
 
@@ -355,3 +556,6 @@ class TaylorRegularizer(BaseRegularizer):
 
         return lambda_i.detach(), g_flat.detach(), l_i.detach()
    
+# regularizers.py
+
+# regularizers.py

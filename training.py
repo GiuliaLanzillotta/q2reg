@@ -15,7 +15,7 @@ import utils_landscape
 import bitbybit.utils as utils
 
 def train_task(model, train_iterator, regularizer, optimizer, scheduler, 
-               loss_fn, num_steps, device, landscape_interval=1):
+               loss_fn, num_steps, device, hard_projection=False):
     
     model.train()
     # Stats accumulators
@@ -23,27 +23,38 @@ def train_task(model, train_iterator, regularizer, optimizer, scheduler,
     total_task_loss = 0.0
     total_reg_loss = 0.0
     
-    # Store landscape metrics to average over the chunk
-    landscape_metrics = []
 
 
     for step in range(num_steps):
         x, y, _ = next(train_iterator)
         x, y = x.to(device), y.to(device)
 
+        # 1. Snapshot BEFORE step
+        previous_params = utils.get_flat_params(model).clone()
+
         optimizer.zero_grad()
-        
         output = model(x)
         task_loss = loss_fn(output, y)
-        reg_loss = regularizer.compute_total_reg_loss(model)
-        
-        total_loss = task_loss + reg_loss
-        total_loss.backward()
-        
 
+        # Logic Split
+        if hard_projection:
+            # A. Hard Mode: Loss is just task loss
+            total_loss = task_loss
+            reg_loss = torch.tensor(0.0)
+        else:
+            # B. Soft Mode: Loss includes penalty
+            reg_loss = regularizer.compute_total_reg_loss(model)
+            total_loss = task_loss + reg_loss
+            
+        total_loss.backward()
         optimizer.step()
         scheduler[0].step()
         
+        # 2. Projection AFTER step (only if hard mode)
+        if hard_projection:
+            regularizer.project_weights(model, previous_params_flat=previous_params)
+
+
         # 5. Track Basic Stats
         total_task_loss += task_loss.item()
         total_reg_loss += reg_loss
@@ -177,6 +188,99 @@ def evaluate_on_all_past(model, replay_buffer, loss_fn, device):
     
     return {'mean_loss': mean_loss, 'mean_accuracy': mean_accuracy}
 
+@torch.no_grad()
+def evaluate_model(model, data_loader, loss_fn, device):
+    """
+    Evaluates model's loss and accuracy on a provided DataLoader.
+    
+    Args:
+        model (nn.Module): The model to evaluate.
+        data_loader (DataLoader): The loader containing the evaluation set.
+        loss_fn: The loss function.
+        device: The device to run on.
+    
+    Returns:
+        A dict containing 'loss' and 'accuracy'.
+    """
+    model.eval()
+    
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    for x, y, _ in data_loader: # Unpacking the 3-tuple from your dataset
+        x, y = x.to(device), y.to(device)
+        
+        output = model(x)
+        loss = loss_fn(output, y)
+        
+        # Accumulate metrics
+        batch_size = y.size(0)
+        total_loss += loss.item() * batch_size
+        
+        preds = torch.argmax(output, dim=1)
+        total_correct += (preds == y).sum().item()
+        total_samples += batch_size
+        
+    if total_samples == 0:
+        return {'loss': 0.0, 'accuracy': 0.0}
+        
+    return {
+        'loss': total_loss / total_samples,
+        'accuracy': total_correct / total_samples
+    }
+
+@torch.no_grad()
+def evaluate_cl_system(network, env, current_task_idx, config, loss_fn, device):
+    """
+    Evaluates ALL tasks in the environment to track learning, forgetting, 
+    and forward transfer.
+    """
+    network.eval()
+    total_tasks = config['environment_args']['num_tasks']
+    
+    # Storage for raw task metrics
+    raw_results = {'train': {}, 'test': {}}
+    
+    for t_idx in range(total_tasks):
+        for split in ['train', 'test']:
+            # Load the full dataset for the task
+            data = env.init_single_task(task_number=t_idx, train=(split == 'train'))
+            loader = DataLoader(data, batch_size=config.get('batch_size', 32), shuffle=False)
+            
+            # Use the generic evaluator we built
+            metrics = evaluate_model(network, loader, loss_fn, device)
+            raw_results[split][t_idx] = metrics
+
+    # --- Compute Specific Averages ---
+    summary = {}
+    for split in ['train', 'test']:
+        accuracies = [raw_results[split][i]['accuracy'] for i in range(total_tasks)]
+        
+        # 1. Total Average (All tasks)
+        avg_total = np.mean(accuracies)
+        
+        # 2. Current Task Accuracy
+        curr_acc = accuracies[current_task_idx]
+        
+        # 3. Past Average (Tasks 0 to current-1)
+        past_accs = accuracies[:current_task_idx]
+        avg_past = np.mean(past_accs) if past_accs else 0.0
+        
+        # 4. Future Average (Tasks current+1 to end)
+        future_accs = accuracies[current_task_idx+1:]
+        avg_future = np.mean(future_accs) if future_accs else 0.0
+        
+        summary[split] = {
+            'task_raw': raw_results[split],
+            'avg_total': avg_total,
+            'avg_past': avg_past,
+            'current': curr_acc,
+            'avg_future': avg_future
+        }
+
+    network.train()
+    return summary
 
 def track_geometry_dynamics(model, top_eigs, previous_params, task_anchor_params):
     """

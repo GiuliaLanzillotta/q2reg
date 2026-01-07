@@ -1,8 +1,13 @@
 # Experiment setup
 reg_type: 'taylor-full'      # 'ewc', 'taylor-diag', 'taylor-full'
-accumulate: true     # Goal 2: True (keep/accumulate) or False (reset)
-curvature_type: 'fisher'  # 'hessian', 'fisher'
-ignore_gradient : False  # Whether to ignore the gradient term in Taylor expansion
+accumulate: True     # Goal 2: True (keep/accumulate) or False (reset)
+curvature_type: 'fisher'  # 'hessian', 'fisher', 'true_fisher'
+ignore_gradient : True  # Whether to ignore the gradient term in Taylor expansion
+spectral_threshold: 0.99999
+spectral_override: False
+spectral_rank: 200
+hard_spectral_cut: False
+projection: False
 
 # Data
 environment: '2d_classification'  # fixed
@@ -16,8 +21,9 @@ environment_args:
 # Training
 alpha: 1.0         # Regularization strength
 num_steps: 100       # Steps *per task* - make it a multiple of log_every_n_steps
-reg_subsample_frac: 0.1  # Fraction of task data to use for regularizer update (1.0 = all)
-replay_subsample_frac: 1.0
+reg_frac: 0.1       # Fraction of task data to use for regularizer update (1.0 = all)
+replay_frac: 0.1
+data_relationship: 'shared'  # 'shared', 'disjoint', 'independent'
 batch_size: 32
 optimizer: 
   name: 'adam'     # 'sgd', 'adam'
@@ -32,7 +38,7 @@ scheduler:
 network:
   name: 'MLP'        # 'mlp', 'cnn'
   depth: 1
-  width: 100
+  width: 250
   activation: 'relu'  # 'relu', 'tanh', 'sigmoid'
 loss: 'CE'  # 'MSE', 'CE'
 
@@ -40,7 +46,7 @@ loss: 'CE'  # 'MSE', 'CE'
 # How often to log metrics during a task's training (in steps)
 log_every_n_steps: 1
 landscape_interval: 1
-
+save_initial_artifacts: false
 # Extra args
 seed : 42
 device : 'cuda:4'

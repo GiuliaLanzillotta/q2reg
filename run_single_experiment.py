@@ -51,7 +51,7 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
     shadow_monitor = utils_monitor.ShadowMonitor(config, loss_fn)
     
     replay_buffer = [] 
-    results = {} 
+    results = {}
     top_eigs = None
 
     print(f"=== Starting Loop: Mode={training_mode}, Tasks={config['environment_args']['num_tasks']} ===")
@@ -88,6 +88,7 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
         projection_history = []
         task_anchor_params = utils.get_flat_params(network).clone()
         previous_params = utils.get_flat_params(network) # Initialize outside loop
+        reg_rank = 0
         if t > 0:
 
             print("Computing top eigenvectors of regularizer for alignment check...")
@@ -104,11 +105,12 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
                 
                 # 2. Extract Top Eigenvectors (e.g. Top 10)
                 if total_lambda is not None:
-                    top_eigs = utils_landscape.get_top_eigenvectors(
+                    top_eigs, reg_rank = utils_landscape.get_top_eigenvectors(
                         total_lambda, 
                         k=10, 
                         structure=ref_reg.structure
                     )
+                    print(f"  [Geometry] Regularizer Rank: {reg_rank}")
                     # CRITICAL: Move to GPU immediately
                     if top_eigs is not None:
                         top_eigs = top_eigs.to(device)
@@ -120,13 +122,17 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
         if t > 0:
             # sanity check, this should be zero 
             monitor_stats = utils_monitor.evaluate_shadow_monitors(network, shadow_monitor, device)
-            past_metrics_all = training.evaluate_on_all_past(network, replay_buffer, loss_fn, device)
-            
             acc_reg = np.mean([m['accuracy'] for m in monitor_stats])
+            pre_eval = training.evaluate_cl_system(network, env, t, config, loss_fn, device)
+            task_metrics['performance'].append({'task': t, 'phase': 'pre', **pre_eval})
+            test_s = pre_eval['test']
             tqdm.write(
                 f"  [T{t+1}, PRE]+ | "
-                f"PAST-ALL Acc: {past_metrics_all['mean_accuracy']*100:6.2f}% | "
-                f"PAST-REG Acc: {acc_reg*100:6.2f}%"
+                f"Current Task Avg: {test_s['current']*100:6.2f}% | " 
+                f"Average Past Acc: {test_s['avg_past']*100:6.2f}% | "
+                f"Average Future Acc: {test_s['avg_future']*100:6.2f}% | "
+                f"Total Mean Acc:   {test_s['avg_total']*100:6.2f}%"
+                f"\n Avg Reg Acc: {acc_reg*100:6.2f}%"
             )
             # C. Track Alignment
             if top_eigs is not None:
@@ -146,12 +152,26 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
             # A. Train Step
             avg_acc, avg_task_loss, avg_reg_loss = training.train_task(
                 network, task_iterator, active_regularizer, optimizer, 
-                scheduler, loss_fn, config['log_every_n_steps'], device
+                scheduler, loss_fn, 
+                config['log_every_n_steps'], 
+                device, 
+                hard_projection=config['projection']
             )
-            perf_dict = {'accuracy': avg_acc, 'task_loss': avg_task_loss, 'reg_loss': avg_reg_loss}
+
             
             step = (chunk_idx + 1) * config['log_every_n_steps']
             
+
+            # Evaluate on ALL past samples 
+            during_eval = training.evaluate_cl_system(network, env, t, config, loss_fn, device)
+            task_metrics['performance'].append({'task': t, 'phase': 'during', 'step': step, 'avg_task_loss': avg_task_loss, 'avg_reg_loss': avg_reg_loss, 'train_batch_acc': avg_acc,**during_eval})
+            test_s = during_eval['test']
+            log_string = f"  [T{t+1}, Step {step: >4}] | " + \
+                f"Current Task Avg: {test_s['current']*100:6.2f}% | " +\
+                f"Average Past Acc: {test_s['avg_past']*100:6.2f}% | "+\
+                f"Average Future Acc: {test_s['avg_future']*100:6.2f}% | "+\
+                f"Total Mean Acc:   {test_s['avg_total']*100:6.2f}%"
+
             # Landscape Stats
             if chunk_idx % config['landscape_interval'] == 0:
                 landscape_stats = utils_landscape.evaluate_landscape_sharpness(
@@ -164,35 +184,19 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
                 
                 # Merge
                 full_landscape_stats = {**landscape_stats, **grad_stats}
+                full_landscape_stats['reg_rank'] = reg_rank
                 task_metrics['landscape'].append(full_landscape_stats)
+
+                log_string += f"Sharp: {landscape_stats.get('sharpness_curr', 0):.4f} | "
                 
 
-            # B. Evaluate & Log
+            # B. Evaluate the regularizers & Log
             if t > 0:
                 # Monitor Stats (Past Reg samples)
                 monitor_stats = utils_monitor.evaluate_shadow_monitors(network, shadow_monitor, device)
-
-                
                 task_metrics['history'].append(monitor_stats)
-                
-                
-                # Evaluate on ALL past samples (Replay Buffer)
-                past_metrics_all = training.evaluate_on_all_past(network, replay_buffer, loss_fn, device)
-
                 acc_reg = np.mean([m['accuracy'] for m in monitor_stats])
-                
-
-
-                tqdm.write(
-                    f"  [T{t+1}, Step {step: >4}] | "
-                    f"CURR: {avg_acc*100:5.1f}% | "
-                    f"ALL: {past_metrics_all['mean_accuracy']*100:5.1f}% | "
-                    f"REG: {acc_reg*100:5.1f}% | "
-                    f"Sharp: {landscape_stats.get('sharpness_curr', 0):.4f}"
-                )
-
-                perf_dict['all_accuracy'] = past_metrics_all['mean_accuracy']
-                perf_dict['reg_accuracy'] = acc_reg
+                log_string += f"\n Avg Reg Acc: {acc_reg*100:6.2f}%"
 
                 # C. Track Alignment
                 if top_eigs is not None:
@@ -206,36 +210,30 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
                     alignment_history.append(align_scores)
                     projection_history.append(proj_scores)
 
-            else:
-                tqdm.write(f"  [T{t+1}, Step {step: >4}] | CURR: {avg_acc*100:5.1f}%" 
-                           f"Sharp: {landscape_stats.get('sharpness_curr', 0):.4f}")
 
-        task_metrics['performance'].append(perf_dict)
+            tqdm.write(log_string)
 
         if t > 0: 
             task_metrics['alignments_with_top_eigs'] = alignment_history
             task_metrics['projections_along_top_eigs'] = projection_history
+        
         results[t] = task_metrics
 
         # --- Post-Task Updates ---
         print(f"  > Task {t} Done. Sampling datasets...")
-
-        # 1. Sample for Replay Buffer
-        frac_replay = config.get('replay_frac', 0.1)
-        ds_replay = utils.subsample_dataset(task_data, frac_replay)
-
-        # 2. Sample for Regularizer/Monitor
-        frac_reg = config.get('reg_frac', 0.05)
-        ds_reg = utils.subsample_dataset(task_data, frac_reg)
+        # --- 4. DATA SAMPLING (The Overhaul) ---
+        # Using the new relationship logic (shared/disjoint/independent)
+        ds_replay, ds_reg = utils_io.get_task_subsets(task_data, config)
 
         # 3. Update Active Regularizer
         if training_mode == 'regularized':
             artifact_path = None
-            if t == 0: 
+            if t == 0 and config.get('save_initial_artifacts', False): 
                 # Construct path: results/.../artifacts/task_0
                 # Using the config['save_path_slug'] we created earlier
                 save_path = os.path.join(config.get('output_dir', './results'), config.get('storage_folder', 'debug'), f"seed_{config.get('seed', 0)}")
                 artifact_path = os.path.join(save_path, 'artifacts', f'task_{t}')
+            
             
             # Call Update with the path
             active_regularizer.update(
@@ -243,20 +241,21 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
                 ds_reg, 
                 loss_fn, 
                 accumulate=config['accumulate'],
-                save_path=artifact_path # <--- Pass the trigger
+                save_path=artifact_path, # <--- Pass the trigger, rn disabled
             )
             
         # 4. Update Shadow Monitor
         shadow_monitor.update(network, ds_reg)
-        
         # 5. Update Replay Buffer
         replay_buffer.append(ds_replay)
 
         # --- Final Task Eval (Optional but good for summary) ---
         if t > 0:
-             past_metrics_all = training.evaluate_on_all_past(network, replay_buffer, loss_fn, device)
-             print(f"  > End Task {t+1} Summary: Past-All Accuracy: {past_metrics_all['mean_accuracy']*100:.2f}%")
-        
+            post_eval = training.evaluate_cl_system(network, env, t, config, loss_fn, device)
+            test_s = post_eval['test']
+            print(f"Task {t} Finished.\n", \
+                  "Per task results (test):", " ".join([f"{x['accuracy']*100:6.2f}" for _,x in test_s['task_raw'].items()]))
+
     return results
 
 def make_config_slug(config):
@@ -273,6 +272,9 @@ def make_config_slug(config):
         'accumulate', 
         'ignore_gradient',
         'alpha',
+        'spectral_override',
+        'hard_spectral_cut',
+        'projection',
         # 'gamma'  <-- Future proofing: just add this here later!
     ]
     
@@ -284,7 +286,19 @@ def make_config_slug(config):
             else:
                 parts.append(f"with_grad")
             continue
-
+        if k == 'spectral_override': # Special handling for boolean
+            if config.get(k, False):
+                parts.append(f"spectral_override")
+            continue
+        if k == 'hard_spectral_cut': # Special handling for boolean
+            if config.get(k, False):
+                parts.append(f"hard_spectral_cut")
+            continue
+        if k == 'projection': # Special handling for boolean
+            if config.get(k, False):
+                parts.append(f"projected")
+                print("Projection Enabled")
+            continue
         # Get val, default to 'NA' if missing
         val = config.get(k, 'NA')
         
@@ -314,9 +328,10 @@ def main():
     parser.add_argument('--mode', type=str, default='cl', choices=['sequential', 'regularized', 'replay'])
     parser.add_argument('--output_dir', type=str, default='./results')
 
-    parser.add_argument('--curvature', type=str, default=None, choices=['hessian', 'fisher'],help="Type of curvature matrix to use (hessian=True 2nd derivative, fisher=Gradient outer product)")
+    parser.add_argument('--curvature', type=str, default=None, choices=['hessian', 'fisher', 'true_fisher'],help="Type of curvature matrix to use (hessian=True 2nd derivative, fisher=Gradient outer product)")
     parser.add_argument('--ignore_gradient', action='store_true', 
                         help="If set, the Taylor approximation drops the linear g*delta term.")
+    parser.add_argument('--spectral_override', action='store_true', default=False, dest='spectral_override')
     
     args = parser.parse_args()
 
@@ -333,10 +348,13 @@ def main():
     if args.mode is not None: config['training_mode'] = args.mode
     if args.curvature is not None: config['curvature_type'] = args.curvature
     if args.ignore_gradient:
-            config['ignore_gradient'] = False
+            config['ignore_gradient'] = True
     else:
         # Ensure default is set explicitly for clarity in logs
         config['ignore_gradient'] = config.get('ignore_gradient', False)
+    if args.spectral_override: 
+        config['spectral_override'] = True
+        print("Spectral Override Activated")
     
     # Set device
     config['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'

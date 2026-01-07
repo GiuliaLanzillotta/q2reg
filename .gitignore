@@ -1,3 +1,10 @@
 logs 
 results
 __pycache__
+*.fls
+*.out
+*.fdb_latexmk
+*.gz
+*.aux
+*.log
+*.synctex.gz

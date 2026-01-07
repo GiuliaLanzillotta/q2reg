@@ -2,9 +2,49 @@
 import torch
 import json
 import os
+import numpy as np
 from datetime import datetime
 import pickle
 
+def get_task_subsets(task_data, config):
+    """
+    Handles the three data relationship modes:
+    1. 'independent': Samples are taken separately (current behavior).
+    2. 'shared': Both get the exact same subset of data.
+    3. 'disjoint': They get different samples with zero overlap.
+    """
+    mode = config.get('data_relationship', 'independent')
+    f_replay = config.get('replay_frac', 0.1)
+    f_reg = config.get('reg_frac', 0.1)
+    
+    n_total = len(task_data)
+    indices = np.arange(n_total)
+    
+    if mode == 'shared':
+        # Both use the same fraction. If fractions differ, we take the larger 
+        # and sub-slice for the smaller.
+        print("  [Data Split] Using 'shared' data relationship for replay and regularization.")
+        f_max = max(f_replay, f_reg)
+        shared_idx = np.random.choice(indices, int(n_total * f_max), replace=False)
+        idx_replay = shared_idx[:int(n_total * f_replay)]
+        idx_reg = shared_idx[:int(n_total * f_reg)]
+        
+    elif mode == 'disjoint':
+        # Ensure no overlap: we need (f_replay + f_reg) of the total data
+        if f_replay + f_reg > 1.0:
+            raise ValueError("Replay + Reg fractions exceed 1.0 for disjoint mode.")
+        all_sampled = np.random.choice(indices, int(n_total * (f_replay + f_reg)), replace=False)
+        split_point = int(n_total * f_replay)
+        idx_replay = all_sampled[:split_point]
+        idx_reg = all_sampled[split_point:]
+        
+    else: # 'independent'
+        idx_replay = np.random.choice(indices, int(n_total * f_replay), replace=False)
+        idx_reg = np.random.choice(indices, int(n_total * f_reg), replace=False)
+
+    ds_replay = torch.utils.data.Subset(task_data, idx_replay)
+    ds_reg = torch.utils.data.Subset(task_data, idx_reg)
+    return ds_replay, ds_reg
 
 def save_experiment_results(results, config, base_dir='results'):
     """
