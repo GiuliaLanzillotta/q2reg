@@ -15,7 +15,7 @@ import utils_landscape
 import bitbybit.utils as utils
 
 def train_task(model, train_iterator, regularizer, optimizer, scheduler, 
-               loss_fn, num_steps, device, hard_projection=False):
+               loss_fn, num_steps, device, hard_projection=False, grad_clip=False):
     
     model.train()
     # Stats accumulators
@@ -47,6 +47,7 @@ def train_task(model, train_iterator, regularizer, optimizer, scheduler,
             total_loss = task_loss + reg_loss
             
         total_loss.backward()
+        if grad_clip: torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler[0].step()
         
@@ -283,30 +284,44 @@ def evaluate_cl_system(network, env, current_task_idx, config, loss_fn, device):
     return summary
 
 def track_geometry_dynamics(model, top_eigs, previous_params, task_anchor_params):
-    """
-    Computes geometric interactions between the model's movement and the 
-    regularizer's forbidden directions.
-    
-    Returns:
-        align_scores: Cosine alignment of the update step (Velocity).
-        proj_scores: Scalar projection of total displacement (Drift).
-        current_params: The current flat parameters (to update state).
-    """
     current_params = utils.get_flat_params(model)
+    eps = 1e-12
     
-    # 1. ALIGNMENT (Velocity)
-    # "Are we moving in the forbidden direction right now?"
+    # 1. VELOCITY (Step-wise movement)
     update_vec = current_params - previous_params
+    update_norm = update_vec.norm().item()
     
-    if update_vec.norm() > 1e-12:
-        align_scores = utils_landscape.compute_alignment(update_vec, top_eigs)
-    else:
-        align_scores = [0.0] * len(top_eigs)
-
-    # 2. PROJECTION (Position / Drift)
-    # "How far have we drifted from the start of the task along this axis?"
-    # Note: We use (current - task_start), NOT (current - previous)
+    # 2. DRIFT (Total movement from anchor)
     displacement = current_params - task_anchor_params
-    proj_scores = utils_landscape.compute_projection(displacement, top_eigs)
+    disp_norm = displacement.norm().item()
+
+    # --- Efficiency: One call to compute projections ---
+    # We use raw dot products for math, then derive alignment from them
+    # proj_k = <vec, v_k>
+    vel_dots = torch.mv(top_eigs, update_vec) if update_norm > eps else torch.zeros(len(top_eigs))
+    disp_dots = torch.mv(top_eigs, displacement) if disp_norm > eps else torch.zeros(len(top_eigs))
+
+    # --- Calculate Leakage (Pythagorean theorem in the subspace) ---
+    # norm_in_subspace = sqrt(sum(proj_k^2))
+    norm_vel_on_top = torch.norm(vel_dots).item()
+    norm_disp_on_top = torch.norm(disp_dots).item()
+
+    # Leakage = 1 - (proportion of norm captured by top eigenvectors)
+    leakage_vel = 1.0 - (norm_vel_on_top / (update_norm + eps))
+    leakage_drift = 1.0 - (norm_disp_on_top / (disp_norm + eps))
+
+    # --- Format Outputs for your existing Analysis Code ---
+    # align_scores: Dot products normalized by update_norm (Cosine Similarity)
+    align_scores = (vel_dots / (update_norm + eps)).tolist()
+    # proj_scores: Raw dot products (Distance)
+    proj_scores = disp_dots.tolist()
+
+    metrics = {
+        'align_scores': align_scores,
+        'proj_scores': proj_scores,
+        'leakage_vel': max(0.0, leakage_vel),
+        'leakage_drift': max(0.0, leakage_drift),
+        'total_disp_norm': disp_norm
+    }
     
-    return align_scores, proj_scores, current_params
+    return metrics, current_params

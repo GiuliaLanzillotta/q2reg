@@ -176,6 +176,7 @@ class BaseRegularizer(ABC):
         print(f"Update magnitude after projection: {torch.norm(new_delta).item():.6f}")
         utils.set_flat_params(model, current_params)
 
+
     def compute_per_sample_proxy_loss(self, model, sample_index):
         """Computes the proxy loss \hat\loss_{i|t-1}(\vparam) for a single sample i."""
         if self.anchor_param_list is None:
@@ -193,38 +194,47 @@ class BaseRegularizer(ABC):
         
         proxy_loss = self._compute_quadratic_form(delta, lambda_i, g_i) + self.per_sample_losses[sample_index]
         return proxy_loss
-    
+        
     def compute_per_sample_proxy_loss_and_grad(self, model, sample_index):
         """
-        Computes both the proxy loss \hat\loss_i(\vparam) and its gradient
-        \nabla \hat\loss_i(\vparam) for a single sample i.
+        Refined proxy computation to decompose first and second order terms.
+        Returns: proxy_loss, total_proxy_grad, and the predicted_delta_loss (g)
         """
         if self.anchor_param_list is None:
             raise RuntimeError("Regularizer not initialized.")
             
         current_params = utils.get_flat_params(model)
-        # --- Get the sample-specific anchor ---
         anchor_k_idx = self.past_sample_anchor_idx[sample_index]
         anchor_k = self.anchor_param_list[anchor_k_idx].to(current_params.device)
+        
+        # Delta (the step from the anchor)
         delta = current_params - anchor_k
 
-        lambda_i = self.per_sample_importances[sample_index].to(current_params.device)
-        g_i = self.per_sample_grads[sample_index].to(current_params.device)
+        Lambda_i = self.per_sample_importances[sample_index].to(current_params.device)
+        g_anchor = self.per_sample_grads[sample_index].to(current_params.device)
+        L_anchor = self.per_sample_losses[sample_index]
         
-        # 1. Compute Proxy Loss: \delta^T \Lambda_i \delta
-        proxy_loss = self._compute_quadratic_form(delta, lambda_i, g_i) + self.per_sample_losses[sample_index]
+        # --- 1. First Order Term: g^T * delta ---
+        first_order_change = torch.dot(g_anchor, delta)
         
-        # 2. Compute Proxy Gradient: 2 * \Lambda_i * \delta
+        # --- 2. Second Order Term (g): 1/2 * delta^T * Lambda * delta ---
+        # Note: Added the 1/2 coefficient to match standard Taylor expansion
         if self.structure == 'diag':
-            # lambda_i is a vector, \Lambda_i is its diagonal matrix
-            proxy_grad = g_i + 2 * lambda_i * delta
+            second_order_change = 0.5 * torch.sum(Lambda_i * (delta ** 2))
+            second_order_grad = Lambda_i * delta # Gradient of the second order term
         elif self.structure in ['block', 'full']:
-            # lambda_i is the full matrix \Lambda_i
-            proxy_grad = g_i + 2 * (lambda_i @ delta)
-        else:
-            raise ValueError(f"Unknown structure: {self.structure}")
-            
-        return proxy_loss, proxy_grad
+            second_order_change = 0.5 * delta.t() @ (Lambda_i @ delta)
+            second_order_grad = Lambda_i @ delta
+        
+        # Total Proxy Loss: L(θ*) + g^TΔ + 1/2 Δ^T H Δ
+        proxy_loss = L_anchor + first_order_change + second_order_change
+        
+        # Total Proxy Gradient: g_anchor + H*Δ
+        # This is the "pull" the regularizer exerts at the current theta
+        total_proxy_grad = g_anchor + second_order_grad
+                
+        return proxy_loss, total_proxy_grad, second_order_change.item()
+
 
     @abstractmethod
     def _compute_importance_and_grad(self, model, x, y, anchor_params, loss_fn):
@@ -243,6 +253,7 @@ class BaseRegularizer(ABC):
         """
         model.eval()
         new_anchor_params = utils.get_flat_params(model).clone().detach()
+        drift_stats = {}
 
         if accumulate:
             # --- TASK-SPECIFIC ANCHORS ---
@@ -285,7 +296,13 @@ class BaseRegularizer(ABC):
             new_grads = []
             new_losses = []
             new_anchor_indices = []
-            
+
+
+            if len(self.per_sample_importances) > 0:
+                old_total_curvature = self.get_total_curvature() # Q at theta_{t-1}
+            else:
+                old_total_curvature = None
+
             # 1. Re-compute for *existing* samples
             for i, (x, y) in enumerate(self.past_samples):
                 # Re-compute \Lambda_i, g_i around the *new* global anchor
@@ -297,6 +314,17 @@ class BaseRegularizer(ABC):
                 # self.past_samples[i] and self.past_sample_peak_acc[i] are preserved
                 self.anchor_groups[new_anchor_idx].append(len(new_importances)-1)
             
+            # 2. Compute Drift Metrics
+            if old_total_curvature is not None:
+                # We compute the NEW curvature sum ONLY for the OLD samples
+                # (to ensure a fair apples-to-apples comparison)
+                new_curvature_old_samples = self._sum_importances(new_importances[:len(self.past_samples)])
+                
+                drift_stats = self._compute_drift_metrics(
+                    old_total_curvature.to(new_anchor_params.device), 
+                    new_curvature_old_samples.to(new_anchor_params.device)
+                )
+
             # 2. Compute for *new* samples
             for x, y, _ in task_dataset:
                 x, y = x.unsqueeze(0), y.unsqueeze(0)
@@ -330,6 +358,47 @@ class BaseRegularizer(ABC):
 
         if save_path is not None:
             self.save_artifacts(save_path)
+        
+        return drift_stats
+
+    def _compute_drift_metrics(self, Q_old, Q_new, k=50):
+        """
+        Quantifies Fisher Drift, specifically focusing on the rotation 
+        of the top-K 'protected' subspace.
+        """
+        with torch.no_grad():
+            # 1. Magnitude Drift (Trace Ratio)
+            tr_old = torch.trace(Q_old) if Q_old.dim() > 1 else Q_old.sum()
+            tr_new = torch.trace(Q_new) if Q_new.dim() > 1 else Q_new.sum()
+            mag_drift = (tr_new / (tr_old + 1e-8)).item()
+
+            # 2. Subspace Overlap (Top-K Eigenvectors)
+            if Q_old.dim() > 1: # For Full/Block Curvature
+                # Get eigenvectors (eigh returns sorted ascending)
+                _, evecs_o = torch.linalg.eigh(Q_old)
+                _, evecs_n = torch.linalg.eigh(Q_new)
+
+                # Extract top K (the largest eigenvalues are at the end)
+                V_old = evecs_o[:, -k:] # [P, K]
+                V_new = evecs_n[:, -k:] # [P, K]
+
+                # Subspace Similarity Metric: Trace(V_old^T @ V_new @ V_new^T @ V_old) / K
+                # Range [0, 1]. 1.0 means the subspaces are identical.
+                # This is essentially the mean squared cosine of the principal angles.
+                projection_overlap = torch.matmul(V_old.t(), V_new) # [K, K]
+                overlap_score = (torch.norm(projection_overlap)**2 / k).item()
+            else:
+                # For Diagonal: Use Weighted Cosine Similarity
+                # Since we don't have eigenvectors, we check if the importance 
+                # has shifted to different parameters.
+                overlap_score = torch.nn.functional.cosine_similarity(
+                    Q_old.unsqueeze(0), Q_new.unsqueeze(0)
+                ).item()
+
+            return {
+                'fisher_mag_drift': mag_drift,
+                'fisher_subspace_overlap': overlap_score
+            }
 
     def precompute_spectral_subspaces(self):
         """

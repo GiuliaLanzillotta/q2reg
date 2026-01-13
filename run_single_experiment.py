@@ -80,40 +80,29 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
             train_loader = task_loader
             
         task_iterator = itertools.cycle(train_loader)
-        task_metrics = {'history': [], 'landscape': [], 'performance': []}
+        task_metrics = {'history': [], 'landscape': [], 'performance': [], 'drift': []}
 
         # --- Setup Alignment Tracking (Using Shadow Monitor as Reference) ---
-        top_eigs = None
         alignment_history = []
         projection_history = []
         task_anchor_params = utils.get_flat_params(network).clone()
         previous_params = utils.get_flat_params(network) # Initialize outside loop
-        reg_rank = 0
-        if t > 0:
+        
 
-            print("Computing top eigenvectors of regularizer for alignment check...")
-            
-            # We use the shadow monitor (Accumulate) as the "Ground Truth" for geometry
-            # This works for Sequential, Replay, AND Regularized modes!
-            ref_reg = shadow_monitor.reg_accum
-            
-            if len(ref_reg.per_sample_importances) > 0:
-                # print("Computing top eigenvectors of Shadow Monitor for alignment check...")
-                
-                # 1. Sum per-sample importances -> Total Curvature
-                total_lambda = utils_landscape.get_total_curvature_from_regularizer(ref_reg)
-                
-                # 2. Extract Top Eigenvectors (e.g. Top 10)
-                if total_lambda is not None:
-                    top_eigs, reg_rank = utils_landscape.get_top_eigenvectors(
-                        total_lambda, 
-                        k=10, 
-                        structure=ref_reg.structure
-                    )
-                    print(f"  [Geometry] Regularizer Rank: {reg_rank}")
-                    # CRITICAL: Move to GPU immediately
-                    if top_eigs is not None:
-                        top_eigs = top_eigs.to(device)
+        print("Computing top eigenvectors of regularizer for alignment check...")
+        # We use a batch from the shadow monitor or the current task to trigger the call
+        # This single call now handles ALL your geometry initialization
+        geo_metrics, top_eigs = utils_landscape.evaluate_landscape_geometry(
+            network, shadow_monitor, loss_fn, device, task_data,
+            k_eigs=100
+        )
+        task_metrics['landscape'].append(geo_metrics)
+        if t > 0:
+            print(f"  [Geometry] Rank: {geo_metrics['rank_past']}")
+            print(f"  [Geometry] Top 100 Eigs capture {geo_metrics['energy_frac_top_k']:.2%}")
+        
+        if top_eigs is not None:
+            top_eigs = top_eigs.to(device)
 
         # --- Training Loop ---
         num_chunks = config['num_steps'] // config['log_every_n_steps']
@@ -165,6 +154,7 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
             # Evaluate on ALL past samples 
             during_eval = training.evaluate_cl_system(network, env, t, config, loss_fn, device)
             task_metrics['performance'].append({'task': t, 'phase': 'during', 'step': step, 'avg_task_loss': avg_task_loss, 'avg_reg_loss': avg_reg_loss, 'train_batch_acc': avg_acc,**during_eval})
+
             test_s = during_eval['test']
             log_string = f"  [T{t+1}, Step {step: >4}] | " + \
                 f"Current Task Avg: {test_s['current']*100:6.2f}% | " +\
@@ -174,28 +164,32 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
 
             # Landscape Stats
             if chunk_idx % config['landscape_interval'] == 0:
-                landscape_stats = utils_landscape.evaluate_landscape_sharpness(
-                    network, task_data, shadow_monitor, loss_fn, device
+
+                geo_metrics, top_eigs = utils_landscape.evaluate_landscape_geometry(
+                    network, shadow_monitor, loss_fn, device, task_data,
+                    k_eigs=100
                 )
                 
+                if t > 0:
+                    print(f"  [Geometry] Rank: {geo_metrics['rank_past']}")
+                    print(f"  [Geometry] Top 100 Eigs capture {geo_metrics['energy_frac_top_k']:.2%}")
                 # Also compute Gradient Norms here if you moved them out of train_task
                 # (Optional, but keeps train_task pure)
                 grad_stats = utils_landscape.compute_gradient_stats(network, shadow_monitor.reg_accum, loss_fn, task_data, device)
                 
                 # Merge
-                full_landscape_stats = {**landscape_stats, **grad_stats}
-                full_landscape_stats['reg_rank'] = reg_rank
+                full_landscape_stats = {**geo_metrics, **grad_stats}
                 task_metrics['landscape'].append(full_landscape_stats)
 
-                log_string += f"Sharp: {landscape_stats.get('sharpness_curr', 0):.4f} | "
+                log_string += f"Sharp: {geo_metrics.get('sharpness_curr', 0):.4f} | "
                 
 
             # B. Evaluate the regularizers & Log
             if t > 0:
                 # Monitor Stats (Past Reg samples)
                 monitor_stats = utils_monitor.evaluate_shadow_monitors(network, shadow_monitor, device)
-                task_metrics['history'].append(monitor_stats)
                 acc_reg = np.mean([m['accuracy'] for m in monitor_stats])
+                task_metrics['history'].append(monitor_stats)
                 log_string += f"\n Avg Reg Acc: {acc_reg*100:6.2f}%"
 
                 # C. Track Alignment
@@ -217,7 +211,6 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
             task_metrics['alignments_with_top_eigs'] = alignment_history
             task_metrics['projections_along_top_eigs'] = projection_history
         
-        results[t] = task_metrics
 
         # --- Post-Task Updates ---
         print(f"  > Task {t} Done. Sampling datasets...")
@@ -245,9 +238,11 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
             )
             
         # 4. Update Shadow Monitor
-        shadow_monitor.update(network, ds_reg)
+        drift_stats = shadow_monitor.update(network, ds_reg)
         # 5. Update Replay Buffer
         replay_buffer.append(ds_replay)
+
+        task_metrics['drift'].append(drift_stats)
 
         # --- Final Task Eval (Optional but good for summary) ---
         if t > 0:
@@ -256,7 +251,11 @@ def run_experiment_loop(config, env, network_init_fn, optimizer_init_fn, schedul
             print(f"Task {t} Finished.\n", \
                   "Per task results (test):", " ".join([f"{x['accuracy']*100:6.2f}" for _,x in test_s['task_raw'].items()]))
 
+
+        results[t] = task_metrics
+
     return results
+
 
 def make_config_slug(config):
     """

@@ -20,21 +20,25 @@ environment_args:
 
 # Training
 alpha: 1.0         # Regularization strength
-num_steps: 100       # Steps *per task* - make it a multiple of log_every_n_steps
+num_steps: 300       # Steps *per task* - make it a multiple of log_every_n_steps
 reg_frac: 0.1       # Fraction of task data to use for regularizer update (1.0 = all)
 replay_frac: 0.1
 data_relationship: 'shared'  # 'shared', 'disjoint', 'independent'
 batch_size: 32
 optimizer: 
-  name: 'adam'     # 'sgd', 'adam'
+  name: 'sgd'     # 'sgd', 'adam'
   lr: 0.01
   warmup_on: false      # Whether to use learning rate warmup
   weight_decay: 0.001
+  momentum: 0.9
+  grad_clip: true    # Whether to use gradient clipping
 scheduler:
-  name: 'cosine_anneal'  # 'step', 'plateau', 'cosine_anneal'
+  name: 'one_cycle'  # 'step', 'plateau', 'cosine_anneal'
   eps: 1e-8            # Epsilon for optimizers
   patience: 20         # Early stopping patience (in epochs)
-  steps_per_task: 100  # Number of steps per task (for scheduler)
+  steps_per_task: 300  # Number of steps per task (for scheduler)
+  step_scheduler_decay: 0.2  # Decay factor for 'step' scheduler
+  scheduler_step: 200  # Step size for 'step' scheduler
 network:
   name: 'MLP'        # 'mlp', 'cnn'
   depth: 1
@@ -44,7 +48,7 @@ loss: 'CE'  # 'MSE', 'CE'
 
 # Tracking
 # How often to log metrics during a task's training (in steps)
-log_every_n_steps: 1
+log_every_n_steps: 10
 landscape_interval: 1
 save_initial_artifacts: false
 # Extra args

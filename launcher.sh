@@ -4,19 +4,19 @@
 source ../clenv/bin/activate
 
 # === Configuration ===
-CONFIG="config_2D_classification.yaml"
-EXP_NAME="study_q2approx_v1"
+CONFIG="config_toy_FullReg.yaml"
+EXP_NAME="study_q2approx_v2"
 
 # Define available GPUs (Using GPU 2 twice means 2 concurrent jobs on GPU 2)
-GPUS=(2 2) 
+GPUS=(1 1) 
 
 # Hyperparams
-SEEDS=(11 21 33)
-REG_TYPES=("taylor-full" "taylor-diag" "taylor-block")
+SEEDS=(28 33 13)
+REG_TYPES=("taylor-full")
 CURVATURES=("fisher" "true_fisher")    
 ACC_OPTS=("true" "false")              # (true means flag is present)
-ALPHAS=(1.0)
-MODES=("regularized" "replay" "sequential")
+ALPHAS=(0.05 0.5 5.0)
+MODES=("regularized")
 
 # =====================
 
@@ -67,7 +67,7 @@ for seed in "${SEEDS[@]}"; do
                         fi
 
                         # Unique log filename including curvature and accumulation state
-                        LOG_FILE="${LOG_DIR}/s${seed}_${reg}_${curv}_${mode}_${ACC_LABEL}.log"
+                        LOG_FILE="${LOG_DIR}/s${seed}_${reg}_${curv}_${mode}_${ACC_LABEL}_alpha${alpha}.log"
 
                         # Build command
                         cmd="python -u run_single_experiment.py \

@@ -1,0 +1,56 @@
+# Experiment setup
+reg_type: 'taylor-full'      # 'ewc', 'taylor-diag', 'taylor-full'
+accumulate: True     # Goal 2: True (keep/accumulate) or False (reset)
+curvature_type: 'true_fisher'  # 'hessian', 'fisher', 'true_fisher'
+ignore_gradient : True  # Whether to ignore the gradient term in Taylor expansion
+spectral_threshold: 0.99999
+spectral_override: False
+spectral_rank: 200
+hard_spectral_cut: False
+projection: False
+
+# Data
+environment: '2d_classification'  # fixed
+environment_args:
+  train_ratio: 0.8
+  npz_file: 'sine_dataset_10.npz'
+  root: '../datasets/synthetic/'
+  num_tasks: 9
+
+
+# Training
+alpha: 0.05         # Regularization strength
+num_steps: 300       # Steps *per task* - make it a multiple of log_every_n_steps
+reg_frac: 0.1       # Fraction of task data to use for regularizer update (1.0 = all)
+replay_frac: 0.1
+data_relationship: 'shared'  # 'shared', 'disjoint', 'independent'
+batch_size: 32
+optimizer: 
+  name: 'sgd'     # 'sgd', 'adam'
+  lr: 0.0008
+  warmup_on: false      # Whether to use learning rate warmup
+  weight_decay: 0.001
+  momentum: 0.9
+  grad_clip: true    # Whether to use gradient clipping
+scheduler:
+  name: 'one_cycle'  # 'step', 'plateau', 'cosine_anneal'
+  eps: 1e-8            # Epsilon for optimizers
+  patience: 20         # Early stopping patience (in epochs)
+  steps_per_task: 300  # Number of steps per task (for scheduler)
+  step_scheduler_decay: 0.2  # Decay factor for 'step' scheduler
+  scheduler_step: 200  # Step size for 'step' scheduler
+network:
+  name: 'MLP'        # 'mlp', 'cnn'
+  depth: 1
+  width: 250
+  activation: 'relu'  # 'relu', 'tanh', 'sigmoid'
+loss: 'CE'  # 'MSE', 'CE'
+
+# Tracking
+# How often to log metrics during a task's training (in steps)
+log_every_n_steps: 10
+landscape_interval: 50
+save_initial_artifacts: false
+# Extra args
+seed : 42
+device : 'cuda:4'

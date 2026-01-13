@@ -37,25 +37,20 @@ def compute_current_task_sharpness(model, x, y, loss_fn):
         model, loss_fn, x, y, params_flat=None
     )
 
-    
-    
-    # Compute Eigenvalues (Symmetric)
-    _, eigvals, _ = torch.linalg.svd(H_full)
+    # 2. Fast Eigenvalue Decomposition for Symmetric Matrices
+    # eigvalsh is much faster than svd or eig
+    eigvals = torch.linalg.eigvalsh(H_full)
 
-    # 3. Compute Numerical Rank
-    # Floating point math is noisy, so we don't check > 0.0.
-    # We check if values are > threshold (e.g. 0.0001% of the max eigenvalue).
-    max_abs_eig = torch.max(torch.abs(eigvals))
-    tolerance = max_abs_eig * 1e-6 if max_abs_eig > 0 else 1e-6
-    
-    # Count how many eigenvalues represent "real" curvature info
+    # 3. Numerical Rank with Vectorized Tolerance
+    max_eig = eigvals[-1]
+    tolerance = max_eig * 1e-6 if max_eig > 0 else 1e-6
     rank = (eigvals.abs() > tolerance).sum().item()
     
     return {
-        'sharpness': eigvals[-1].item(),
+        'sharpness': max_eig.item(),
         'trace': eigvals.sum().item(),
         'rank': int(rank),
-        'rank_fraction': rank / len(eigvals) # Percentage of dimensions that are active
+        'rank_fraction': rank / len(eigvals)
     }
 
 def compute_past_sharpness(model, regularizer, loss_fn, sample_limit=200):
@@ -64,7 +59,7 @@ def compute_past_sharpness(model, regularizer, loss_fn, sample_limit=200):
     Reuses compute_current_task_sharpness.
     """
     if not regularizer.past_samples:
-        return {'sharpness_past': 0.0, 'trace_past': 0.0, 'rank_past': 0, 'rank_fraction_past': 0.0}
+        return {'sharpness': 0.0, 'trace': 0.0, 'rank': 0, 'rank_fraction': 0.0}
     
     device = next(model.parameters()).device
     
@@ -88,12 +83,7 @@ def compute_past_sharpness(model, regularizer, loss_fn, sample_limit=200):
     res = compute_current_task_sharpness(model, x_batch, y_batch, loss_fn)
     
     # Rename keys for clarity in logs
-    return {
-        'sharpness_past': res['sharpness'], 
-        'trace_past': res['trace'],
-        'rank_past': res['rank'],
-        'rank_fraction_past': res['rank_fraction']
-    }
+    return res
 
 def compute_grad_hessian_alignment(model, current_grad, regularizer):
     """
@@ -165,42 +155,65 @@ def get_total_curvature_from_regularizer(regularizer):
         
     return total_curvature
 
-def get_top_eigenvectors(matrix, k=1, structure='full', tol = 1e-6):
+def get_top_eigenvectors(matrix, k=1, structure='full', tol=1e-6):
     """
-    Returns the top-k eigenvectors of the aggregated curvature.
+    Returns:
+        vectors: Top-k eigenvectors.
+        rank: Numerical rank of the matrix.
+        energy_fraction: (Sum of top-k eigenvalues) / (Sum of all eigenvalues).
     """
     
     if structure == 'diag':
-        # matrix is 1D tensor (Diagonal). 
-
         # matrix is 1D tensor [D]
-        # A. Compute Rank (Count of non-zero elements)
-        rank = (matrix.abs() > tol).sum().item()
+        # We use .abs() to ensure energy is positive (relevant for Hessian)
+        abs_matrix = matrix.abs()
+        total_energy = abs_matrix.sum().item()
+        
+        # A. Compute Rank
+        rank = (abs_matrix > tol).sum().item()
 
-        # Eigenvectors are canonical basis vectors at indices of largest elements.
-        top_indices = torch.topk(matrix, k).indices
+        # B. Get Top K
+        top_result = torch.topk(matrix, k)
+        energy_top_k = top_result.values.abs().sum().item()
+        
+        # C. Fraction (Handle div by zero)
+        energy_fraction = (energy_top_k / total_energy) if total_energy > 0 else 0.0
+
+        # D. Construct eigenvectors
+        top_indices = top_result.indices
         vectors = []
         d = matrix.shape[0]
         for idx in top_indices:
             v = torch.zeros(d, device=matrix.device)
             v[idx] = 1.0
             vectors.append(v)
-        return torch.stack(vectors), rank # (k, d)
+            
+        return torch.stack(vectors), rank, energy_fraction
 
     elif structure in ['full', 'block']:
-        # matrix is 2D. 
         try:
-            # Use eigh for symmetric matrices (Fisher/Hessian are symmetric)
-            # Returns eigenvalues (ascending) and eigenvectors
             L, V = torch.linalg.eigh(matrix)
-            rank = (L.abs() > tol).sum().item()
+            abs_L = L.abs()
+            total_energy = abs_L.sum().item()
             
-            # Take last k columns (largest eigenvalues) and transpose to rows
+            # A. Compute Rank
+            rank = (abs_L > tol).sum().item()
+            
+            # B. Top K Energy
+            # eigh returns ascending, so top k are at the end
+            energy_top_k = abs_L[-k:].sum().item()
+            
+            # C. Fraction
+            energy_fraction = (energy_top_k / total_energy) if total_energy > 0 else 0.0
+            
+            # D. Extract top eigenvectors (descending order)
             top_vectors = V[:, -k:].T.flip(0) 
-            return top_vectors, rank
+            
+            return top_vectors, rank, energy_fraction
+            
         except Exception as e:
             print(f"Eigen-decomp failed: {e}")
-            return None, None
+            return None, None, None
             
 def compute_alignment(update_vector, eigen_vectors):
     """
@@ -244,40 +257,79 @@ def evaluate_landscape_sharpness(model, task_data, shadow_monitor, loss_fn, devi
     x_curr, y_curr, _ = next(iter(loader))
     x_curr, y_curr = x_curr.to(device), y_curr.to(device)
     
-    # Reuse your existing robust Hessian computation
+    # --- 1. CURRENT TASK ---
     res_curr = compute_current_task_sharpness(model, x_curr, y_curr, loss_fn)
+    metrics.update({f'{k}_curr': v for k, v in res_curr.items()})
     
-    metrics['sharpness_curr'] = res_curr['sharpness']
-    metrics['trace_curr'] = res_curr['trace']
-    metrics['rank_curr'] = res_curr['rank']
-    metrics['rank_fraction_curr'] = res_curr['rank_fraction']
-    
-    # --- 2. PAST TASK SHARPNESS ---
-    # We use the Accumulate Monitor as the source of truth for "Past Constraints"
-    # It acts as a Regularizer object, so it has .past_samples
+    # --- 2. PAST TASKS ---
     if shadow_monitor is not None and hasattr(shadow_monitor, 'reg_accum'):
-        past_reg = shadow_monitor.reg_accum
-        
-        # Reuse your existing past sharpness wrapper
-        # (Ensure utils_landscape.compute_past_sharpness is defined as discussed previously)
-        res_past = compute_past_sharpness(model, past_reg, loss_fn, sample_limit=sample_size)
-        
-        metrics['sharpness_past'] = res_past['sharpness_past']
-        metrics['trace_past'] = res_past['trace_past']
-        metrics['rank_past'] = res_past['rank_past']
-        metrics['rank_fraction_past'] = res_past['rank_fraction_past']
-    else:
-        metrics['sharpness_past'] = 0.0
-        metrics['trace_past'] = 0.0
-        metrics['rank_past'] = 0.0
-        metrics['rank_fraction_past'] = 0.0
+        # Reuse the existing utility but ensure it uses eigvalsh internally
+        res_past = compute_past_sharpness(model, shadow_monitor.reg_accum, loss_fn)
+        metrics.update({f'{k}_past': v for k, v in res_past.items()})
         
     return metrics
 
+def evaluate_landscape_geometry(model, shadow_monitor, loss_fn, device, task_data, k_eigs=0, sample_size=200):
+    """
+    Evaluates curvature AND optionally extracts top eigenvectors.
+    k_eigs: If > 0, returns the top k eigenvectors of the past regularizer.
+    """
+    model.eval()
+    metrics = {}
+    
+    # Quick subsample from the dataset
+    indices = np.random.choice(len(task_data), min(len(task_data), sample_size), replace=False)
+    subset = Subset(task_data, indices)
+    # Create a loader just to handle collate_fn automatically
+    loader = DataLoader(subset, batch_size=sample_size)
+    x_curr, y_curr, _ = next(iter(loader))
+    x_curr, y_curr = x_curr.to(device), y_curr.to(device)
+    
+    # --- 1. CURRENT TASK GEOMETRY ---
+    # We still use this for sharpness/trace/rank
+    res_curr = compute_current_task_sharpness(model, x_curr, y_curr, loss_fn)
+    metrics.update({f'{k}_curr': v for k, v in res_curr.items()})
+    
+    # --- 2. PAST TASK GEOMETRY & EIGENVECTORS ---
+    top_eigs = None
+    if shadow_monitor is not None and hasattr(shadow_monitor, 'reg_accum'):
+        past_reg = shadow_monitor.reg_accum
+        
+        # Get total curvature matrix Q
+        Q = get_total_curvature_from_regularizer(past_reg)
+        
+        if Q is not None:
+            # eigh is for symmetric matrices. returns (evals, evecs)
+            evals, evecs = torch.linalg.eigh(Q)
+            
+            # Sort descending (eigh returns ascending)
+            idx = torch.argsort(evals, descending=True)
+            evals = evals[idx]
+            evecs = evecs[:, idx]
+            
+            # Compute standard metrics
+            max_eig = evals[0]
+            tolerance = max_eig * 1e-6 if max_eig > 0 else 1e-6
+            rank = (evals.abs() > tolerance).sum().item()
+            
+            metrics.update({
+                'sharpness_past': max_eig.item(),
+                'trace_past': evals.sum().item(),
+                'rank_past': int(rank),
+                'rank_fraction_past': rank / len(evals)
+            })
+            
+            # Extract top K eigenvectors for the "Geometry Dynamics" tracking
+            if k_eigs > 0:
+                top_eigs = evecs[:, :k_eigs].t() # Shape [K, P]
+                energy_frac = evals[:k_eigs].sum() / (evals.sum() + 1e-8)
+                metrics['energy_frac_top_k'] = energy_frac.item()
+
+    return metrics, top_eigs
 
 # utils.py
 
-def compute_gradient_stats(model, regularizer, loss_fn, task_data, device, sample_size=32):
+def compute_gradient_stats(model, regularizer, loss_fn, task_data, device, sample_size=200):
     """
     Computes Gradient Norms and Cosine Similarity between Task and Reg gradients.
     """
@@ -319,4 +371,5 @@ def compute_gradient_stats(model, regularizer, loss_fn, task_data, device, sampl
         stats['grad_norm_reg'] = 0.0
         stats['grad_cos_sim'] = 0.0
         
+    model.zero_grad()
     return stats

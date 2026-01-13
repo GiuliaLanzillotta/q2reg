@@ -7,6 +7,9 @@
 \usepackage{booktabs}
 \usepackage{cleveref}
 \usepackage{graphicx}
+\usepackage{comment}
+\usepackage{multirow}
+\usepackage{amssymb}
 
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{.8em} 
@@ -98,37 +101,154 @@ We compute the regularizer on a subset of the task data, namely a random $10\%$ 
 \end{itemize}
 
 \paragraph{Initial results.}
-We executed some initial experiments on a small model (one hidden layer MLP with 502 parameters) on a sequence of 9 binary classification tasks in 2D. 
+We executed some initial experiments on a small model (one hidden layer MLP with  parameters) on a sequence of 9 binary classification tasks in 2D. 
+
+\textit{Note.} The regularization strength has not been optimized, and the optimization hyperparameters are the same across all methods for comparison.
 
 \begin{table}[ht]
 \centering
-\caption{Impact of Curvature Refreshing on Accuracy and Approximation Fidelity}
+\caption{Impact of Curvature Refreshing on Accuracy and Approximation Fidelity (Taylor-Full)}
 \label{tab:strategy_comparison}
-\begin{tabular}{lcccc}
+\small
+\begin{tabular}{lccccc}
 \toprule
-Strategy & All Acc. ($\uparrow$) & Reg. Acc. ($\uparrow$) & $\kappa$ Loss ($\downarrow$) & $\kappa$ Grad ($\downarrow$) \\
+Strategy & Past Avg ($\uparrow$) & Curr. Acc ($\uparrow$) & Reg. Acc ($\uparrow$) & $\kappa$ Loss ($\downarrow$) & $\kappa$ Grad ($\downarrow$) \\
 \midrule
-\multicolumn{5}{c}{\textit{Final Step}} \\
+\multicolumn{6}{c}{\textit{Final Step}} \\
 \midrule
-Accumulate & $0.688 \pm 0.053$ & $0.654 \pm 0.051$ & $3.382 \pm 1.015$ & $6.354 \pm 0.334$ \\
-Refresh    & $\mathbf{0.742} \pm 0.037$ & $\mathbf{0.725} \pm 0.025$ & $\mathbf{0.056} \pm 0.064$ & $\mathbf{5.522} \pm 0.593$ \\
+Accumulate & $0.68 \pm 0.04$ & $\mathbf{0.88} \pm 0.16$ & $0.67 \pm 0.10$ & $3.25 \pm 1.44$ & $8.50 \pm 1.73$ \\
+Refresh    & $\mathbf{0.72} \pm 0.01$ & $0.71 \pm 0.04$ & $\mathbf{0.73} \pm 0.01$ & $\mathbf{0.04} \pm 0.03$ & $\mathbf{6.93} \pm 0.21$ \\
 \midrule
-\multicolumn{5}{c}{\textit{Trajectory Average}} \\
+\multicolumn{6}{c}{\textit{Trajectory Average}} \\
 \midrule
-Accumulate & $0.668 \pm 0.053$ & $0.662 \pm 0.026$ & $2.845 \pm 0.872$ & $6.379 \pm 0.571$ \\
-Refresh    & $\mathbf{0.710} \pm 0.069$ & $\mathbf{0.705} \pm 0.021$ & $\mathbf{0.407} \pm 0.134$ & $\mathbf{5.825} \pm 0.392$ \\
+Accumulate & $0.63 \pm 0.01$ & $0.84 \pm 0.02$ & $0.69 \pm 0.05$ & $2.18 \pm 0.68$ & $8.47 \pm 1.20$ \\
+Refresh    & $\mathbf{0.64} \pm 0.01$ & $\mathbf{0.85} \pm 0.00$ & $\mathbf{0.72} \pm 0.03$ & $\mathbf{0.22} \pm 0.03$ & $\mathbf{7.50} \pm 0.71$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \paragraph{The refresh rate of the approximation.}
-In \cref{tab:strategy_comparison}, we compare the 'accumulate' and 'refresh' strategies for curvature computation using the True Fisher Information Matrix. The results indicate that refreshing the curvature at each task end significantly improves both the overall accuracy and the fidelity of the quadratic approximation, as evidenced by lower $\kappa$ loss and gradient errors. These findings suggest that maintaining an up-to-date curvature matrix is crucial for effective regularization in continual learning scenarios.
+In \cref{tab:strategy_comparison}, we compare the 'accumulate' and 'refresh' strategies for curvature computation using the True Fisher Information Matrix. The results indicate that refreshing the curvature at each task end improves both the overall accuracy and the fidelity of the quadratic approximation, as evidenced by lower $\kappa$ loss and gradient errors. However, the performance is overall moderate. When comparing regularization to sequential training and replay (\cref{fig:current_train_accuracy}), we observe that regularization achieves performance on par with sequential training and replay on the current task (second column) on almost all tasks. Therefore, the lower average performance is due to forgetting. 
 
+
+
+
+\paragraph{The optimization implicit bias.}
+In \cref{tab:mode_comparison}, we compare the three training modes: sequential, regularized (with curvature refresh), and replay on the same metrics as before. Replay significantly outperforms both other methods across all metrics. Crucially, replay scores the lowest approximation errors. What is more, the same low approximation errors are scored even when not refreshing the curvature (as shown in \cref{tab:kappa_comparison}), indicating that \textbf{replay helps maintain the model within the validity region of the quadratic approximation}
+
+\begin{table}[ht]
+\centering
+\caption{Cross-Mode Performance Comparison: Sequential, Regularized (Refresh), and Replay. Values reported as mean $\pm$ standard deviation.}
+\label{tab:mode_comparison}
+\small
+\begin{tabular}{lccccc}
+\toprule
+Mode & Past Avg ($\uparrow$) & Curr. Acc ($\uparrow$) & Reg. Acc ($\uparrow$) & $\kappa$ Loss ($\downarrow$) & $\kappa$ Grad ($\downarrow$) \\
+\midrule
+\multicolumn{6}{c}{\textit{Final Step}} \\
+\midrule
+Sequential    & $0.68 \pm 0.06$ & $\mathbf{0.95} \pm 0.03$ & $0.69 \pm 0.07$ & $0.71 \pm 0.42$ & $5.01 \pm 1.04$ \\
+Regularized   & $0.71 \pm 0.01$ & $0.81 \pm 0.17$ & $0.70 \pm 0.05$ & $0.13 \pm 0.12$ & $7.21 \pm 0.58$ \\
+Replay        & $\mathbf{0.91} \pm 0.02$ & $0.93 \pm 0.04$ & $\mathbf{0.93} \pm 0.02$ & $\mathbf{0.11} \pm 0.04$ & $\mathbf{3.26} \pm 0.43$ \\
+\midrule
+\multicolumn{6}{c}{\textit{Trajectory Average}} \\
+\midrule
+Sequential    & $0.62 \pm 0.02$ & $\mathbf{0.88} \pm 0.01$ & $0.68 \pm 0.06$ & $0.97 \pm 0.36$ & $7.32 \pm 1.12$ \\
+Regularized   & $0.64 \pm 0.01$ & $0.85 \pm 0.01$ & $0.69 \pm 0.05$ & $0.42 \pm 0.11$ & $7.83 \pm 0.82$ \\
+Replay        & $\mathbf{0.78} \pm 0.01$ & $0.87 \pm 0.01$ & $\mathbf{0.89} \pm 0.02$ & $\mathbf{0.22} \pm 0.02$ & $\mathbf{4.16} \pm 0.42$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\caption{Comparison of Approximation Fidelity ($\kappa$ metrics) across Non-Refreshed (Stale) Methods.}
+\label{tab:kappa_comparison}
+\small
+\begin{tabular}{lccccc}
+\toprule
+& \multicolumn{2}{c}{\textit{Final Step}} & \multicolumn{2}{c}{\textit{Trajectory Average}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+\textbf{Mode} & $\kappa$ Loss ($\downarrow$) & $\kappa$ Grad ($\downarrow$) & $\kappa$ Loss ($\downarrow$) & $\kappa$ Grad ($\downarrow$) \\
+\midrule
+Sequential   & $2.34 \pm 1.06$ & $9.35 \pm 1.48$ & $3.54 \pm 1.20$ & $13.44 \pm 1.37$ \\
+Regularized  & $3.49 \pm 1.47$ & $8.50 \pm 1.73$ & $2.40 \pm 0.66$ & $8.47 \pm 1.20$ \\
+Replay       & $\mathbf{0.46} \pm 0.18$ & $\mathbf{4.74} \pm 0.73$ & $\mathbf{0.44} \pm 0.16$ & $\mathbf{5.33} \pm 0.93$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+From these results we also conclude that regularization only marginally improves performance over sequential training. This is further confirmed by \cref{fig:past_train_accuracy}, which shows the training accuracy on previous tasks across training steps.
+
+
+\paragraph{The curvature matrix approximation.} ...
+
+\begin{table}[ht]
+\centering
+\caption{Final Step Comparison: Curvature Approximations. ($\checkmark$) signals refreshed curvature; ($\times$) signals stale curvature.}
+\label{tab:final_step_symbols}
+\small
+\begin{tabular}{lll cccc}
+\toprule
+\textbf{Matrix} & \textbf{Curvature} & \textbf{Upd.} & \textbf{Past Avg} ($\uparrow$) & \textbf{Reg. Acc} ($\uparrow$) & \textbf{$\kappa$ Loss} ($\downarrow$) & \textbf{$\kappa$ Grad} ($\downarrow$) \\
+\midrule
+\multirow{4}{*}{Block} & \multirow{2}{*}{Fisher} & $\checkmark$ & $0.69 \pm \text{---}$ & $0.70 \pm \text{---}$ & $0.17 \pm \text{---}$ & $6.92 \pm \text{---}$ \\
+& & $\times$ & $0.68 \pm 0.02$ & $0.65 \pm 0.08$ & $2.22 \pm 0.03$ & $7.87 \pm 1.63$ \\
+\cmidrule(lr){2-7}
+& \multirow{2}{*}{True Fisher} & $\checkmark$ & $0.71 \pm 0.01$ & $0.69 \pm 0.07$ & $0.16 \pm 0.15$ & $7.42 \pm 0.63$ \\
+& & $\times$ & $0.66 \pm \text{---}$ & $0.63 \pm \text{---}$ & $2.87 \pm \text{---}$ & $9.12 \pm \text{---}$ \\
+\midrule
+\multirow{4}{*}{Diag} & \multirow{2}{*}{Fisher} & $\checkmark$ & $0.65 \pm 0.03$ & $0.65 \pm 0.05$ & $0.19 \pm 0.07$ & $7.13 \pm 0.26$ \\
+& & $\times$ & $0.65 \pm 0.00$ & $0.65 \pm 0.02$ & $1.52 \pm 0.37$ & $6.73 \pm 0.27$ \\
+\cmidrule(lr){2-7}
+& \multirow{2}{*}{True Fisher} & $\checkmark$ & $0.68 \pm 0.04$ & $0.65 \pm 0.02$ & $0.33 \pm 0.10$ & $6.85 \pm 0.56$ \\
+& & $\times$ & $0.67 \pm 0.02$ & $0.64 \pm 0.02$ & $1.49 \pm 0.20$ & $7.33 \pm 0.27$ \\
+\midrule
+\multirow{4}{*}{Full} & \multirow{2}{*}{Fisher} & $\checkmark$ & $0.67 \pm 0.06$ & $0.66 \pm 0.09$ & $0.33 \pm 0.33$ & $7.68 \pm 1.47$ \\
+& & $\times$ & $0.70 \pm 0.03$ & $0.67 \pm 0.08$ & $2.28 \pm 0.47$ & $7.55 \pm 1.54$ \\
+\cmidrule(lr){2-7}
+& \multirow{2}{*}{True Fisher} & $\checkmark$ & $\mathbf{0.72} \pm 0.01$ & $\mathbf{0.73} \pm 0.01$ & $\mathbf{0.05} \pm 0.03$ & $\mathbf{6.93} \pm 0.21$ \\
+& & $\times$ & $0.68 \pm 0.04$ & $0.67 \pm 0.10$ & $3.49 \pm 1.47$ & $8.50 \pm 1.73$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{On the failure modes of regularization.}
+okay and finally we ask: what is causing regularization to fail so poorly? Clearly one option is the trust region violation, another option is that the approximation is wrong to start with because we are not at a minimum, and the last option is simply that the regularization strength is not well tuned. 
+
+
+So, how would we expect regularization to behave? basically it should prevent the optimization dynamics from going in the directions that are deemed important by the model. So if we look at the projection onto these directions we should see a lower alignment than without regularization... 
+what do we see? So does regularization work as expected? 
+if yes and still breaks -> it's really the trust region
+if no -> then regularization in itself is not working as expected and needs to be fixed 
+
+if 2, then we try with projection. This should work. But if we still do not see an improvement then it is the trust region that is the problem. 
+
+Probably even fixing all the above we still get a bit of difference to replay, due to the trust region. 
+
+\section{Is there a difference between samples?}
+
+
+\section{Learning regimes: regularization works for the lazy.}
 
 \newpage
+\section*{Figures}
 
-The objective of this project is to study the geometric properties of the loss landscape in deep neural networks and leverage these properties for better continual learning and regularization. We specifically focus on the \textbf{Fisher Information Matrix (FIM)} as a proxy for local curvature.
 
+\begin{figure}[ht]
+ \centering
+ \includegraphics[width=0.5\textwidth]{../figures/current_train_accuracy.pdf}
+ \caption{Training Accuracy on the Current Task across Training Steps for Different Methods.}
+ \label{fig:current_train_accuracy}
+\end{figure}
+
+\begin{figure}[ht]
+ \centering
+ \includegraphics[width=0.5\textwidth]{../figures/past_train_accuracy.pdf}
+ \caption{Training Accuracy on the Previous Tasks across Training Steps for Different Methods.}
+ \label{fig:past_train_accuracy}
+\end{figure}
+\begin{comment}
 \section{Fisher Information: Theoretical Foundations}
 We utilize the "True Fisher" for our curvature estimates. We have mathematically verified that the definition based on the expectation of log-probability gradients is equivalent to the Jacobian-based form used in implementation.
 
@@ -177,5 +297,5 @@ In an experiment with a model of $D=502$ parameters, we applied a hard rank cut 
     \item \textbf{Observation:} Accuracy fluctuates during training batches.
     \item \textbf{Explanation:} This is attributed to \textit{sampling noise} (batch variance) rather than weight updates. If parameters are logged, the $L_2$ distance from the start of the task remains effectively zero ($< 10^{-7}$).
 \end{itemize}
-
+\end{comment}
 \end{document}
